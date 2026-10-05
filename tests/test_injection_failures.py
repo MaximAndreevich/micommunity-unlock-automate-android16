@@ -194,3 +194,59 @@ def test_no_early_or_extra_tap_whenever_the_phone_breaks(monkeypatch, cache_file
             assert_safe(out)
         except AssertionError as exc:
             raise AssertionError(f"{fault} at T{moment:+d} s: {out}") from exc
+
+
+# ------------------------------------------------------------- the window at T-3 s
+
+@pytest.mark.parametrize("change, message", [
+    ({"focus": "com.miui.securitycenter"},
+     "'com.miui.securitycenter' has the focus, not Mi Community"),
+    ({"focus": "NotificationShade"}, "'NotificationShade' has the focus"),      # lock screen
+    ({"awake": False}, "the screen is off"),
+], ids=["dialog", "lock screen", "screen off"])
+def test_no_tap_when_the_window_changed_after_the_final_check(monkeypatch, caplog, change,
+                                                              message):
+    dev = FakeDevice()
+    dev.at(at_target(BEFORE_TAP), **change)
+    out = simulate(monkeypatch, dev)
+    assert (out.code, out.attempts, dev.other_window_taps) == (a.EXIT_ERROR, 0, [])
+    assert f"Focus check: {message}" in caplog.text
+    assert "[FAILED] only 0/1 taps" in caplog.text
+    assert dev.store == ORIGINAL_SETTINGS
+
+
+def test_focus_check_is_rehearsed_in_a_dry_run(monkeypatch, caplog):
+    dev = FakeDevice()
+    dev.at(at_target(BEFORE_TAP), focus="com.miui.securitycenter")
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_ERROR
+    assert "[DRY-RUN] tap" not in caplog.text
+    assert "has the focus, not Mi Community" in caplog.text
+
+
+def test_hanging_focus_check_does_not_delay_the_tap(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    dev = FakeDevice()
+    dev.at(at_target(BEFORE_TAP), hang=("dumpsys",))
+    out = simulate(monkeypatch, dev)
+    assert_safe(out)
+    assert (out.code, len(out.injected)) == (a.EXIT_OK, 1)
+    assert "Focus check failed" in caplog.text
+    assert "ms late" not in caplog.text
+
+
+# ------------------------------------------------------------- known gap
+
+def test_window_opened_after_the_focus_check_gets_the_tap(monkeypatch, caplog):
+    """Documents the gap that is left, not a wish: a dialog that opens in the last
+    FOCUS_CHECK_SEC gets the tap at the button's coordinates. The tap is accepted and
+    reported as a success; only the screenshots show what happened."""
+    caplog.set_level("INFO")
+    dev = FakeDevice()
+    dev.at(at_target(-a.FOCUS_CHECK_SEC + 1), focus="com.miui.securitycenter")
+    out = simulate(monkeypatch, dev)
+    assert "Focus check passed" in caplog.text
+    assert (out.code, len(out.injected)) == (a.EXIT_OK, 1)     # injected - into the dialog
+    assert dev.taps == []                                         # not on the button
+    assert dev.other_window_taps == [BUTTON_TAP]
+    assert "[SUCCESS] 1/1 taps injected" in caplog.text
+    assert "Screenshots after the tap" in caplog.text

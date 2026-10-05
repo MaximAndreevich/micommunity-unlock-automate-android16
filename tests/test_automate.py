@@ -319,7 +319,9 @@ def test_late_send_warns(monkeypatch, caplog, late_ms, warns):
     clock = FakeClock()
     button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
     args = a.build_parser().parse_args(["--dry-run"])
-    a.click(FakeDevice(), button, clock, args, planned=clock.t - timedelta(milliseconds=late_ms))
+    planned = clock.t - timedelta(milliseconds=late_ms)
+    fired = a.FiredTaps(a.TimingPlan("fixed", 150, "test"), "", planned, planned)
+    a.click(FakeDevice(), button, clock, args, fired)
     assert ("ms late: planned at" in caplog.text) == warns
 
 
@@ -388,8 +390,7 @@ def test_new_screen_text_after_tap_is_logged(caplog):
     dev = FakeDevice(xml=UI_XML.replace("Apply for unlocking", "Applied, come back tomorrow")
                      .replace('text="20:07"', 'text="00:00"'))
     button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
-    assert a.verify_after_tap(dev, button, "Apply for unlocking", UI_XML,
-                              "10-05 20:07:03.000") == (True, True)
+    assert a.verify_after_tap(dev, button, "Apply for unlocking", UI_XML, "") == (True, True)
     assert "New on screen: Applied, come back tomorrow" in caplog.text   # no systemui clock
     assert "Screen changed after tapping" in caplog.text
 
@@ -430,11 +431,9 @@ def test_inject_events_mention_does_not_cancel_live_run(monkeypatch):
 
 
 def test_logcat_denial_after_tap_fails():
-    dev = FakeDevice()
-    dev.logcat = LOGCAT_DENIAL
     button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
-    assert a.verify_after_tap(dev, button, "Apply for unlocking", UI_XML,
-                              "10-05 20:07:03.000") == (False, None)
+    assert a.verify_after_tap(FakeDevice(), button, "Apply for unlocking", UI_XML,
+                              LOGCAT_DENIAL) == (False, None)
 
 
 

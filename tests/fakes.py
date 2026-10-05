@@ -50,7 +50,8 @@ SETTINGS_EXC = ("Exception occurred while executing 'put':\njava.lang.SecurityEx
 class FakeDevice(a.Device):
     def __init__(self, inject=True, settings=True, focus="com.mi.global.bbs", xml=UI_XML,
                  adbinput=None, brand="Xiaomi", silent_denial=False, inject_ms=70.0,
-                 tap_rt_ms=120.0, inject_log=True):
+                 tap_rt_ms=120.0, inject_log=True, real_tap_inject_ms=None,
+                 device_clock_offset=0.0):
         self.serial = "fake123"
         self.inject, self.settings, self.focus, self.xml = inject, settings, focus, xml
         # Xiaomi toggle; follows `inject` unless set explicitly ("" = property missing)
@@ -59,6 +60,8 @@ class FakeDevice(a.Device):
         self.silent_denial = silent_denial   # taps exit 0, denial only shows in logcat
         self.logcat = ""
         self.probe_taps = []                 # taps outside the unlock button
+        self.other_window_taps = []          # taps while another window had the focus
+        self.awake = True                    # screen on
         self.store = {"global/stay_on_while_plugged_in": "0",
                       "system/screen_off_timeout": "30000"}
         self.taps = []
@@ -68,6 +71,9 @@ class FakeDevice(a.Device):
         self.delays = itertools.cycle(inject_ms if isinstance(inject_ms, (list, tuple))
                                       else [inject_ms])
         self.injections = []                 # (command, moment the event was injected)
+        self.real_tap_inject_ms = real_tap_inject_ms   # the button tap's own delay (None:
+                                                       # the next one of inject_ms)
+        self.clock_offset = device_clock_offset        # phone clock - PC clock, s
         self.tap_rt_ms = tap_rt_ms           # round-trip of a tap command
         self.inject_log = inject_log         # HyperOS logs every injection (MIUIInput)
         self.broken = ()                     # command prefixes failing with an adb error
@@ -118,6 +124,8 @@ class FakeDevice(a.Device):
                 button = a.find_button(self.xml, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
                 if self.silent_denial:
                     self.logcat += LOGCAT_DENIAL + "\n"
+                elif self.focus != a.APP_PACKAGE:
+                    self.other_window_taps.append(cmd)
                 elif button and a._contains(button.bounds, x, y):
                     self.taps.append(cmd)
                 else:
@@ -143,7 +151,7 @@ class FakeDevice(a.Device):
                 else:
                     self.store.pop(f"{parts[2]}/{parts[3]}", None)
         elif cmd.startswith("dumpsys power"):
-            out = "  mWakefulness=Awake"
+            out = f"  mWakefulness={'Awake' if self.awake else 'Asleep'}"
         elif cmd.startswith("dumpsys window"):
             out = (f"  mCurrentFocus=Window{{4f2 u0 {self.focus}/com.mi.Unlock}}"
                    if self.focus != "NotificationShade"
@@ -165,16 +173,21 @@ class FakeDevice(a.Device):
     def _timed_tap(self, cmd, timeout):
         """tap_command(): prints the start time, logs the injection like HyperOS."""
         start = a.time.time()
+        button_taps = len(self.taps)
         res = self.run(cmd, timeout)
-        injected = start + next(self.delays) / 1000
+        hit_button = len(self.taps) > button_taps
+        delay = (self.real_tap_inject_ms if hit_button and self.real_tap_inject_ms is not None
+                 else next(self.delays))
+        injected = start + delay / 1000                # PC clock, for the tests
         if res.returncode == 0 and not self.silent_denial:
             self.injections.append((cmd, injected))
         if res.returncode == 0 and self.inject_log and not self.silent_denial:
-            logged = math.floor(injected * 1000) / 1000   # truncated
+            logged = math.floor((injected + self.clock_offset) * 1000) / 1000   # truncated
             self.logcat += (f"{logged:.3f}  2678 13244 W MIUIInput: Input motion event "
                             "injection from package: null action ACTION_DOWN\n")
         a.time.sleep(self.tap_rt_ms / 1000)
-        return a.ShellResult(cmd, res.returncode, f"miunlock_start={start:.6f}\n" + res.output)
+        return a.ShellResult(cmd, res.returncode,
+                             f"miunlock_start={start + self.clock_offset:.6f}\n" + res.output)
 
 
 VIRTUAL_START = 1_800_000_000.0
@@ -237,8 +250,10 @@ def proven_delay_ms(plan, measured):
 
 
 def assert_timing_invariants(plan, send, target, measured, args):
+    """The first group is computed from the samples, independently of automate.py; the
+    rest restates its formulas (consistency, not safety - see test_timing_invariants)."""
     proven = proven_delay_ms(plan, measured)
-    # no false start: even the fastest measured delivery arrives after target + 50 ms
+    # independent: even the fastest measured delivery arrives after target + 50 ms
     assert send + timedelta(milliseconds=proven) >= target + ms(a.MIN_ARRIVAL_MS)
     # the compensation is whole ms, never more than proven, wasting less than 1 ms
     assert isinstance(plan.compensation_ms, int)
@@ -250,7 +265,7 @@ def assert_timing_invariants(plan, send, target, measured, args):
         assert measured.inject.min <= measured.round_trip.min - adb
     else:
         assert plan.compensation_ms == 0
-    # send time and the bound it promises agree with the plan
+    # consistency: the send time and the bound it promises agree with the plan
     assert send == plan.send_time(target) == target + ms(plan.margin_ms - plan.compensation_ms)
     assert plan.earliest_arrival(target) == target + ms(plan.margin_ms)
     assert send >= target - ms(plan.compensation_ms)
