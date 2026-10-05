@@ -1,11 +1,18 @@
 """Latency cache: loading, saving and compatibility with older formats."""
 
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
-from fakes import VIRTUAL_START, FakeDevice, a, run_with, write_cache
+from fakes import T0, VIRTUAL_START, FakeDevice, a, measurement, ms, run_with, write_cache
+
+FIXTURES = Path(__file__).resolve().with_name("fixtures")
+V1_FILE = FIXTURES / "latency_cache_device_inject_v1.json"        # saved by a real run
+LEGACY_FILE = FIXTURES / "latency_cache_round_trip.json"          # before device_inject_v1
+DELETE = object()
 
 
 def test_measurement_is_saved(monkeypatch, cache_file):
@@ -101,3 +108,146 @@ def test_broken_cache_does_not_stop_the_run(monkeypatch, caplog, cache_file):
     assert run_with(monkeypatch, FakeDevice(), ["--dry-run", "--test-in", "30"]) == a.EXIT_OK
     assert "is unreadable" in caplog.text
     assert "using the standard margin of 150 ms" in caplog.text
+
+
+# --------------------------------------------------------------------------- regression
+
+def load(path, now=None, serial="fake123", max_age_days=7):
+    now = now or datetime(2026, 10, 5, 20, 40, tzinfo=timezone.utc)
+    return a.load_cache(str(path), serial, max_age_days, now)
+
+
+def keys(obj):
+    """Key structure of a cache file: top-level keys, and the keys of the nested stats."""
+    return {k: sorted(v) if isinstance(v, dict) else None for k, v in obj.items()}
+
+
+def test_cache_from_a_real_run_still_loads_and_plans_the_same():
+    cached = load(V1_FILE)
+    m = cached.measured
+    assert (m.inject.min, m.round_trip.min, m.adb_rtt.min, m.net) == (53.04, 127.02, 60.99, None)
+    assert len(m.inject.samples) == len(m.round_trip.samples) == 20
+    args = a.build_parser().parse_args([])
+    plan, send = a.checked_send_time(a.plan_timing(args, m, "cache"), T0)
+    assert (plan.mode, plan.compensation_ms, plan.margin_ms) == ("adaptive", 53, 50)
+    assert send == T0 - ms(3)            # as in the acceptance dry run on the phone
+
+
+def test_cache_format_is_frozen(cache_file):
+    """Changing what save_cache writes needs a new CACHE_METHOD (and a new fixture)."""
+    assert a.CACHE_METHOD == json.loads(V1_FILE.read_text())["method"] == "device_inject_v1"
+    a.save_cache(str(cache_file), "fake123", measurement([70, 75], adb=[5, 6], net=[40]),
+                 "example.org", T0)
+    saved, golden = json.loads(cache_file.read_text()), json.loads(V1_FILE.read_text())
+    golden["net"] = golden["inject"]                 # the fixture was saved without ping
+    assert keys(saved) == keys(golden)
+
+
+@pytest.mark.parametrize("inject, net", [([53.996, 60], None), ([69.9999, 70.004], None),
+                                         ([0.004, 1.5], None), ([53.04, 66.58], [40.995])])
+def test_cached_plan_equals_the_fresh_plan(cache_file, inject, net):
+    """Saving must not round the measurement up: the cached plan sends no earlier."""
+    fresh = measurement(inject, [x + 60 for x in inject], [4.004, 5], net)
+    a.save_cache(str(cache_file), "fake123", fresh, "example.org" if net else None, T0)
+    cached = a.load_cache(str(cache_file), "fake123", 7, T0).measured
+    args = a.build_parser().parse_args([])
+    plans = [a.checked_send_time(a.plan_timing(args, m, "x"), T0) for m in (fresh, cached)]
+    assert plans[0] == plans[1]
+    assert cached == fresh
+
+
+def test_legacy_round_trip_cache_is_ignored_quietly(cache_file, caplog):
+    caplog.set_level("INFO")
+    shutil.copy(LEGACY_FILE, cache_file)
+    assert load(cache_file) is None
+    assert "has an old measurement format (input round-trip) - not used" in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= 30]      # INFO, not a warning
+    assert cache_file.read_text() == LEGACY_FILE.read_text()
+
+
+def test_unknown_method_is_ignored(cache_file, caplog):
+    caplog.set_level("INFO")
+    data = json.loads(V1_FILE.read_text())
+    data["method"] = "device_inject_v2"
+    cache_file.write_text(json.dumps(data))
+    assert load(cache_file) is None
+    assert "old measurement format (device_inject_v2) - not used" in caplog.text
+
+
+def test_fresh_measurement_replaces_a_legacy_cache(monkeypatch, cache_file):
+    shutil.copy(LEGACY_FILE, cache_file)
+    assert run_with(monkeypatch, FakeDevice(), ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
+    assert json.loads(cache_file.read_text())["method"] == a.CACHE_METHOD
+
+
+def test_unknown_extra_keys_are_tolerated(cache_file):
+    data = json.loads(V1_FILE.read_text())
+    data["comment"] = "added by hand"
+    data["inject"]["stddev_ms"] = 7.1
+    cache_file.write_text(json.dumps(data))
+    assert load(cache_file).measured.inject.min == 53.04
+
+
+@pytest.mark.parametrize("field, value", [
+    ("inject", {"samples_ms": [float("nan"), 70]}),
+    ("inject", {"samples_ms": [float("inf")]}),
+    ("inject", {"samples_ms": [-1, 70]}),
+    ("inject", {"samples_ms": ["abc"]}),
+    ("inject", {"samples_ms": 70}),
+    ("inject", None),
+    ("round_trip", {"samples_ms": []}),
+    ("adb_rtt", {"samples_ms": [float("nan")]}),
+    ("measured_at", "yesterday"),
+    ("measured_at", None),
+    ("serial", DELETE),
+    ("connection", DELETE),
+])
+def test_corrupt_values_are_ignored(cache_file, caplog, field, value):
+    data = json.loads(V1_FILE.read_text())
+    data[field] = value
+    if value is DELETE:
+        del data[field]
+    cache_file.write_text(json.dumps(data))        # NaN / Infinity as JSON literals
+    assert load(cache_file) is None
+    assert any(r.levelname == "WARNING" and "ignored" in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize("age, ok", [(timedelta(days=7), True),
+                                     (timedelta(days=7, seconds=1), False),
+                                     (-timedelta(hours=1), True),
+                                     (-timedelta(hours=1, seconds=1), False)])
+def test_cache_age_limits(cache_file, age, ok):
+    write_cache(cache_file, now=T0, age=age)
+    assert (a.load_cache(str(cache_file), "fake123", 7, T0) is not None) == ok
+
+
+def test_failed_save_keeps_the_previous_cache(monkeypatch, cache_file, caplog):
+    shutil.copy(V1_FILE, cache_file)
+
+    def broken_replace(src, dst):
+        raise OSError("disk full")
+    monkeypatch.setattr(a.os, "replace", broken_replace)
+    a.save_cache(str(cache_file), "fake123", measurement([70]), None, T0)
+    assert "Could not save the latency cache" in caplog.text
+    assert cache_file.read_text() == V1_FILE.read_text()
+    assert list(cache_file.parent.glob("*.tmp")) == []
+
+
+def test_save_to_a_missing_directory_only_warns(tmp_path, caplog):
+    a.save_cache(str(tmp_path / "missing" / "c.json"), "fake123", measurement([70]), None, T0)
+    assert "Could not save the latency cache" in caplog.text
+
+
+@pytest.mark.parametrize("host, compensation", [("example.org", 90), ("other.org", 70)])
+def test_cached_ping_is_used_only_for_the_same_api_host(monkeypatch, caplog, cache_file,
+                                                        host, compensation):
+    caplog.set_level("INFO")
+    write_cache(cache_file)
+    data = json.loads(cache_file.read_text())
+    data["net"], data["api_host"] = {"samples_ms": [40.5, 44]}, "example.org"
+    cache_file.write_text(json.dumps(data))
+    argv = ["--dry-run", "--test-in", "30", "--api-host", host]
+    assert run_with(monkeypatch, FakeDevice(), argv) == a.EXIT_OK
+    assert f"compensation {compensation} ms" in caplog.text
+    assert ("No saved ping to other.org" in caplog.text) == (host == "other.org")
