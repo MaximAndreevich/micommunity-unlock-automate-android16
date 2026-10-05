@@ -30,7 +30,6 @@ UI_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
           bounds="[100,2000][980,2140]" enabled="true"/>
   </node>
 </hierarchy>"""
-BUTTON_BOUNDS = (100, 2000, 980, 2140)
 
 SECURITY_EXC = (
     "Exception occurred while executing 'tap':\n"
@@ -78,10 +77,10 @@ class FakeDevice(a.Device):
                 out, rc = SECURITY_EXC.replace("'tap'", f"'{cmd.split()[1]}'"), 255
             elif cmd.startswith("input tap") and "-500" not in cmd:
                 x, y = map(int, cmd.split()[2:4])
-                x1, y1, x2, y2 = BUTTON_BOUNDS
+                button = a.find_button(self.xml, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
                 if self.silent_denial:
                     self.logcat += LOGCAT_DENIAL + "\n"
-                elif x1 <= x <= x2 and y1 <= y <= y2:
+                elif button and a._contains(button.bounds, x, y):
                     self.taps.append(cmd)
                 else:
                     self.probe_taps.append(cmd)
@@ -126,6 +125,7 @@ def use_virtual_time(monkeypatch):
     def fake_sleep(sec):
         now[0] += sec
     monkeypatch.setattr(a.time, "time", fake_time)
+    monkeypatch.setattr(a.time, "monotonic", fake_time)
     monkeypatch.setattr(a.time, "sleep", fake_sleep)
 
 
@@ -229,7 +229,7 @@ def test_audit_probes_inside_the_app_window(monkeypatch, caplog):
     caplog.set_level("INFO")
     dev = FakeDevice()
     assert run_with(monkeypatch, dev, DRY) == a.EXIT_OK
-    assert dev.probe_taps == ["input tap 370 160"]
+    assert dev.probe_taps == ["input tap 370 160"] * 2     # audit + final check
     assert "in Mi Community accepted" in caplog.text
 
 
@@ -317,7 +317,7 @@ def test_ntp_resync_before_target(monkeypatch, wait_sec, expected_syncs):
     monkeypatch.setattr(a.time, "sleep",
                         lambda s: setattr(clock, "t", clock.t + timedelta(seconds=s)))
     target = clock.t + timedelta(seconds=wait_sec)
-    a.wait_until(target, clock, FakeDevice(), need_inject=True)
+    a.wait_until(target, clock, FakeDevice())
     assert clock.syncs == expected_syncs
     assert clock.t >= target
 
@@ -330,3 +330,42 @@ def test_click_stops_after_security_denial(monkeypatch, caplog):
     assert a.click(dev, button, FakeClock(), args) == 0
     assert sum(c.startswith("input tap") for c in dev.commands) == 1
     assert "USB debugging (Security settings)" in caplog.text
+
+
+def test_heartbeat_reports_toggle_reset(monkeypatch, caplog):
+    use_virtual_time(monkeypatch)
+    clock = a.Clock("fake", use_ntp=False)
+    dev = FakeDevice(adbinput="0")
+    a.wait_until(clock.now() + timedelta(seconds=200), clock, dev)
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors and "Security settings" in errors[0].getMessage()
+
+
+def test_final_check_stops_when_toggle_reset(monkeypatch):
+    monkeypatch.setattr(a.time, "sleep", lambda s: None)
+    dev = FakeDevice(adbinput="0")
+    button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+    with pytest.raises(a.DeviceError, match="Security settings"):
+        a.final_check(dev, "Apply for unlocking", button, need_inject=True)
+
+
+def test_final_check_stops_on_silent_denial(monkeypatch):
+    monkeypatch.setattr(a.time, "sleep", lambda s: None)
+    dev = FakeDevice(silent_denial=True, adbinput="")
+    button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+    with pytest.raises(a.DeviceError, match="Permission denied: injecting"):
+        a.final_check(dev, "Apply for unlocking", button, need_inject=True)
+
+
+def test_taps_where_the_button_is_at_fire_time(monkeypatch, caplog):
+    dev = FakeDevice()
+    real_audit = a.run_audit
+
+    def audit_then_scroll(*args):
+        report = real_audit(*args)
+        dev.xml = UI_XML.replace("[100,2000][980,2140]", "[100,1800][980,1940]")
+        return report
+    monkeypatch.setattr(a, "run_audit", audit_then_scroll)
+    assert run_with(monkeypatch, dev, ["--test-in", "5", "--clicks", "1"]) == a.EXIT_OK
+    assert dev.taps == ["input tap 540 1870"]
+    assert "button moved from (540, 2070) to (540, 1870)" in caplog.text

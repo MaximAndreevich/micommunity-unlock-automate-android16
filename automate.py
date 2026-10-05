@@ -62,7 +62,7 @@ SCREEN_TIMEOUT_MAX = "2147483647"
 ADBINPUT_PROP = "persist.security.adbinput"   # Xiaomi: "USB debugging (Security settings)"
 
 HEARTBEAT_SEC = 60.0             # how often to re-check the device while waiting
-FINAL_CHECK_SEC = 20.0           # last full check this many seconds before firing
+FINAL_CHECK_SEC = 30.0           # last full check (UI dump + probe) this long before firing
 NTP_RESYNC_SEC = 60.0            # re-query NTP this many seconds before firing
 
 EXIT_OK, EXIT_ERROR, EXIT_AUDIT, EXIT_INTERRUPTED = 0, 1, 2, 130
@@ -772,25 +772,70 @@ class ScreenKeeper:
             log.info("Screen settings restored.")
 
 
-def health_check(dev: Device, full: bool) -> list[str]:
-    """Problems found right now (empty list = all good)."""
+NOT_RESPONDING = "device is not responding over ADB"
+INJECT_OFF = (f"{ADBINPUT_PROP}=0: 'USB debugging (Security settings)' is OFF, "
+              "taps will be rejected - turn it on again")
+
+
+def health_check(dev: Device) -> list[str]:
+    """Problems found right now (empty list = all good). Cheap, no input injected."""
     if not dev.is_alive():
-        return ["device is not responding over ADB"]
+        return [NOT_RESPONDING]
     problems = []
+    if dev.getprop(ADBINPUT_PROP) == "0":
+        problems.append(INJECT_OFF)
+    if dev.run("settings get global adb_enabled", timeout=10).output.strip() == "0":
+        problems.append("USB debugging (adb_enabled) is off")
     if screen_awake(dev) is False:
         problems.append("screen is off")
     pkg = foreground_package(dev)
     if pkg and pkg != APP_PACKAGE:
         problems.append(f"Mi Community is not in foreground (focused: {pkg})")
-    if full:
-        probe = probe_input_injection(dev, None)
-        if probe.denied:
-            problems.append("input injection is denied again "
-                            "('USB debugging (Security settings)' was reset)")
     return problems
 
 
-def wait_until(target_utc: datetime, clock: Clock, dev: Device, need_inject: bool) -> None:
+def final_check(dev: Device, button_text: str, button: Button,
+                need_inject: bool) -> tuple[Button, str]:
+    """
+    Last check before firing: device state, a fresh UI dump (the app may have restarted
+    or scrolled since the audit), and an in-app injection probe.
+    Returns the button to tap and the UI dump ('' if it failed).
+    Raises DeviceError if tapping is certain to fail.
+    """
+    problems = health_check(dev)
+    for p in problems:
+        log.error("Final check: %s", p)
+    if NOT_RESPONDING in problems or (need_inject and INJECT_OFF in problems):
+        raise DeviceError("device not ready for clicking: " + "; ".join(problems))
+
+    try:
+        xml = dump_ui(dev, attempts=2)
+        fresh = find_button(xml, button_text, BUTTON_RESOURCE_ID)
+    except (DeviceError, ET.ParseError) as exc:
+        log.error("Final check: UI dump failed (%s) - tapping the audited coordinates.", exc)
+        return button, ""
+    if fresh is None:
+        log.error("Final check: '%s' is not on screen - tapping the audited coordinates.",
+                  button_text)
+        return button, xml
+    if (fresh.x, fresh.y) != (button.x, button.y):
+        log.warning("Final check: the button moved from (%d, %d) to (%d, %d).",
+                    button.x, button.y, fresh.x, fresh.y)
+
+    probe = probe_input_injection(dev, find_probe_target(xml, fresh))
+    if probe.denied:
+        msg = f"input injection is denied: {probe.error()}"
+        if need_inject:
+            raise DeviceError("device not ready for clicking: " + msg)
+        log.error("Final check: %s", msg)
+    else:
+        log.info("Final check passed: button at (%d, %d), %s probe ok (%.0f ms).",
+                 fresh.x, fresh.y, "in-app" if probe.targeted else "off-screen",
+                 probe.latency_ms)
+    return fresh, xml
+
+
+def wait_until(target_utc: datetime, clock: Clock, dev: Device) -> None:
     """Sleeps until target, with periodic device health checks and a precise final spin."""
     remaining = (target_utc - clock.now()).total_seconds()
     log.info("Waiting %s until %s UTC.", timedelta(seconds=int(remaining)),
@@ -799,7 +844,6 @@ def wait_until(target_utc: datetime, clock: Clock, dev: Device, need_inject: boo
     # one more NTP sync before firing: the PC clock may drift or get adjusted by the OS
     # during a wait of several hours; skipped for short waits (the startup sync is fresh)
     resync_pending = clock.synced and remaining > NTP_RESYNC_SEC + 30
-    final_checked = False
     next_heartbeat = time.monotonic() + HEARTBEAT_SEC
     while True:
         remaining = (target_utc - clock.now()).total_seconds()
@@ -811,19 +855,11 @@ def wait_until(target_utc: datetime, clock: Clock, dev: Device, need_inject: boo
             clock.sync()
             continue
 
-        if not final_checked and remaining <= FINAL_CHECK_SEC:
-            final_checked = True
-            problems = health_check(dev, full=True)
-            for p in problems:
-                log.error("Final check: %s", p)
-            fatal = [p for p in problems
-                     if "not responding" in p or (need_inject and "denied" in p)]
-            if fatal:
-                raise DeviceError("device not ready for clicking: " + "; ".join(fatal))
-        elif time.monotonic() >= next_heartbeat and remaining > FINAL_CHECK_SEC + 5:
+        if time.monotonic() >= next_heartbeat and remaining > 5:
             next_heartbeat = time.monotonic() + HEARTBEAT_SEC
-            for p in health_check(dev, full=False):
-                log.warning("Heartbeat: %s", p)
+            for p in health_check(dev):
+                log.log(logging.ERROR if p == INJECT_OFF else logging.WARNING,
+                        "Heartbeat: %s", p)
             log.info("%s remaining.", timedelta(seconds=int(remaining)))
 
         if remaining > 2:
@@ -988,8 +1024,13 @@ def run(args) -> int:
              target_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
 
     with ScreenKeeper(dev, report.can_write_settings):
-        wait_until(target_utc, clock, dev, need_inject=not args.dry_run)
-        done = click(dev, report.button, clock, args)
+        check_at = target_utc - timedelta(seconds=FINAL_CHECK_SEC)
+        if check_at > clock.now():
+            wait_until(check_at, clock, dev)
+        button, _xml_before = final_check(dev, args.button_text, report.button,
+                                          need_inject=not args.dry_run)
+        wait_until(target_utc, clock, dev)
+        done = click(dev, button, clock, args)
         if done == args.clicks:
             log.info("[SUCCESS] %d/%d taps %s.", done, args.clicks,
                      "simulated" if args.dry_run else "injected")
