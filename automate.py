@@ -1203,8 +1203,9 @@ def log_plan(plan: TimingPlan, target_utc: datetime, send_utc: datetime,
             log.info("  network RTT to %s: %s (half of min compensated)", api_host,
                      m.net.describe())
     log.info("  compensation %d ms, margin %d ms", plan.compensation_ms, plan.margin_ms)
-    log.info("  send at %s CST / %s local", fmt_time(send_utc, BEIJING_OFFSET),
-             fmt_time(send_utc))
+    log.info("  send at %s CST / %s local (target %+.0f ms)",
+             fmt_time(send_utc, BEIJING_OFFSET), fmt_time(send_utc),
+             (send_utc - target_utc).total_seconds() * 1000)
     log.info("  request reaches the server no earlier than %s CST",
              fmt_time(plan.earliest_arrival(target_utc), BEIJING_OFFSET))
 

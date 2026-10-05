@@ -759,6 +759,7 @@ def test_compensation_is_injection_delay_not_round_trip(monkeypatch, caplog):
     assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
     assert "input tap round-trip (reference, not compensated): min 12" in caplog.text
     assert "compensation 69 ms, margin 50 ms" in caplog.text   # 70 ms - 1 us resolution
+    assert "(target -19 ms)" in caplog.text
 
 
 def test_no_injection_line_uses_standard_margin(monkeypatch, caplog, cache_file):
