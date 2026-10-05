@@ -1582,8 +1582,15 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="examples:\n"
                "  automate.py --dry-run --test-in 90  check setup, rehearse in 90 s, no real tap\n"
                "  automate.py --dry-run --test-in 150 same, including the latency measurement\n"
-               "  automate.py --test-in 30            real tap in 30 s (sends a request!)\n"
-               "  automate.py                         real run at 00:00 CST\n")
+               "  automate.py --test-in 30            REAL tap in 30 s: sends a real unlock\n"
+               "                                      request and blocks the next one for a\n"
+               "                                      minute - never run it after 23:58 CST\n"
+               "  automate.py                         real run at 00:00 CST\n"
+               "\n"
+               "compensation = minimal time from the start of the tap command to the event\n"
+               "injection, both on the phone clock (shell start time + MIUIInput logcat line).\n"
+               "The input round-trip is only logged: the event is injected in the middle of\n"
+               "it, so compensating it would send too early.\n")
     p.add_argument("--clicks", type=int, default=1, help="number of taps (default: 1)")
     p.add_argument("--delay", type=float, default=DEFAULT_CLICK_DELAY_SEC,
                    help="seconds between taps if --clicks > 1, at least "
@@ -1600,8 +1607,9 @@ def build_parser() -> argparse.ArgumentParser:
         "timing", "send = 00:00:00 CST + margin - measured delays (never earlier than "
                   + f"00:00:00 + {MIN_ARRIVAL_MS} ms on the server)")
     t.add_argument("--timing", choices=("adaptive", "fixed"), default="adaptive",
-                   help="adaptive: compensate the measured tap latency (and the network "
-                        "delay with --api-host); fixed: no compensation (default: adaptive)")
+                   help="adaptive: compensate the measured start -> injection delay of the "
+                        "tap on the phone (and the network delay with --api-host); fixed: no "
+                        "compensation (default: adaptive)")
     t.add_argument("--margin-ms", type=int, default=DEFAULT_MARGIN_MS,
                    help="margin of fixed timing and of the fallback without a latency "
                         f"estimate (default: {DEFAULT_MARGIN_MS})")
@@ -1637,7 +1645,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--test-timezone", type=float,
                    help="UTC offset in hours for --test-time (e.g. 3 or 5.5)")
     g.add_argument("--test-in", type=float, metavar="SEC",
-                   help="target = now + SEC seconds (implies --test)")
+                   help="target = now + SEC seconds (implies --test). Without --dry-run "
+                        "the tap is REAL: it sends an unlock request and blocks the next one "
+                        "for a minute - do not run it after 23:58 CST")
     g.add_argument("--save-dump", metavar="FILE", help="save the UI dump XML to FILE")
     g.add_argument("--log-file", metavar="FILE", help="also write the full log to FILE")
     g.add_argument("-v", "--verbose", action="store_true", help="debug logging")
