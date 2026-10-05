@@ -119,8 +119,9 @@ python automate.py --test --test-timezone 2 --test-time 16:20
 ## Tests
 Offline tests with a simulated device (no phone needed):
 ```shell
-pip install pytest
+pip install -r requirements-dev.txt
 python -m pytest -q tests
+pylint automate.py
 ```
 
 ## Alternative
