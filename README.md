@@ -34,10 +34,16 @@ On newer HyperOS builds this toggle:
 - needs a signed-in Mi account (often also a SIM card and internet while you flip it);
 - can reset itself after a reboot/OTA or a failed account check.
 
-Toggle it OFF/ON, replug USB and run `python automate.py --dry-run --test-in 5` —
-it checks this without tapping anything. The same toggle also controls `settings put`
-(keeping the screen on); without it the script still works, but you must set
-the screen timeout manually.
+The toggle state is the property `persist.security.adbinput` (`1` = ON):
+```shell
+adb shell getprop persist.security.adbinput
+```
+With the toggle OFF, `input keyevent 0` or a tap outside the screen still succeed on
+HyperOS 3 — only events delivered into another app's window are rejected. So the script
+treats `adbinput=0` as a failure and probes by tapping static text inside the
+Mi Community window (a title, never the button).
+
+Toggle it OFF/ON, replug USB and run `python automate.py --dry-run --test-in 5`.
 
 ## Set up
 1. Open the Mi community app, switch to global region in the app settings
@@ -48,18 +54,38 @@ the screen timeout manually.
 
 What the script does:
 1. **Preflight audit** — ADB state (unauthorized/offline/several devices), Android/HyperOS version,
-   input injection permission (harmless probe, no taps), settings write permission,
+   input injection permission (`persist.security.adbinput` plus a tap on static text in the
+   Mi Community window, never on the button), settings write permission,
    screen on, Mi Community in the foreground (not the lock screen), the button on screen, NTP clock.
    Any `FAIL` stops the script before it changes anything on the device.
 2. Keeps the screen on and saves the original values.
 3. Waits until 00:00:00 Beijing time minus `--lead-ms` (200 ms by default) using an NTP-corrected clock
-   (NTP is queried once, not in a loop). Re-checks the device every minute and does a full
-   check 20 s before firing (catches the Security settings toggle resetting itself).
+   (NTP is queried once, not in a loop). Re-checks the device and the Security settings
+   toggle every minute. 30 s before firing it dumps the UI again, re-locates the button
+   (the app may have restarted or scrolled) and repeats the in-app probe.
 4. Taps the button `--clicks` times and verifies that each tap was really injected
    (Android prints the exception but still exits with code 0, so the old version reported success anyway).
+   Logs how long each `input` command took: it starts a JVM on the phone, so the tap lands
+   a few hundred ms after the logged time — tune `--lead-ms` with that number.
+   5 s later it checks logcat for rejected injections and logs only the new text on screen
+   (Xiaomi's reply); an unchanged screen is reported as a warning.
 5. Restores the original screen settings — also on Ctrl+C and on errors.
 
 Exit codes: `0` ok, `1` runtime error, `2` audit failed, `130` interrupted.
+
+## Long waits
+The script usually waits many hours. Keep in mind:
+- **Do not let the computer sleep** — the wait and the USB connection die with it. On macOS:
+  `caffeinate -i python automate.py --log-file unlock.log`; on Windows/Linux disable sleep.
+- **Hard stops leave the screen settings changed.** Ctrl+C and errors restore them, but a
+  killed process, sleep or a pulled cable leaves `stay_on_while_plugged_in=7` and a maximal
+  screen timeout. The original values are in the log line `Screen kept on (saved: {...})`:
+  ```shell
+  adb shell settings put global stay_on_while_plugged_in 0
+  adb shell settings put system screen_off_timeout 30000
+  ```
+- **OLED burn-in**: a static page for ~22 h is not great. Start the script closer to the
+  target and turn the brightness down.
 
 ## Usage
 ```shell
