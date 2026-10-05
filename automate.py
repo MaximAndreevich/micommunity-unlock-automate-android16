@@ -870,6 +870,44 @@ def wait_until(target_utc: datetime, clock: Clock, dev: Device) -> None:
             pass  # busy-wait the last 50 ms for precision
 
 
+def screen_texts(xml: str) -> list[str]:
+    """Visible texts of the Mi Community window (system UI such as the clock left out)."""
+    return [n.get("text") for n in ET.fromstring(xml).iter("node")
+            if n.get("text") and n.get("package", APP_PACKAGE) == APP_PACKAGE]
+
+
+def verify_after_tap(dev: Device, button: Button, button_text: str,
+                     xml_before: str, since: str) -> bool:
+    """
+    Checks that the taps had an effect. False if the device rejected them (logcat).
+    An unchanged screen is only a warning: the request may still be on its way.
+    """
+    denial = logcat_denial(dev, since)
+    if denial:
+        log.error("The device rejected the taps: %s", denial)
+        log.error(INJECT_HINT)
+        return False
+    try:
+        xml_after = dump_ui(dev, attempts=1)
+        after = screen_texts(xml_after)
+        before = screen_texts(xml_before) if xml_before else []
+        fresh = find_button(xml_after, button_text, BUTTON_RESOURCE_ID)
+    except (DeviceError, ET.ParseError) as exc:
+        log.warning("Could not check the screen after tapping: %s", exc)
+        return True
+    new = [t for t in after if t not in before]
+    if new:
+        log.info("New on screen: %s", " | ".join(new[:15]))
+    if not xml_before:
+        return True
+    if new or fresh is None or fresh.enabled != button.enabled:
+        log.info("Screen changed after tapping.")
+    else:
+        log.warning("Screen unchanged after tapping - the taps may have been dropped. "
+                    "Check the phone.")
+    return True
+
+
 def click(dev: Device, button: Button, clock: Clock, args) -> int:
     """Taps args.clicks times. Returns the number of taps injected successfully."""
     cmd = f"input tap {button.x} {button.y}"
@@ -882,13 +920,15 @@ def click(dev: Device, button: Button, clock: Clock, args) -> int:
             done += 1
         else:
             try:
-                res = dev.run(cmd, timeout=10)
+                res, latency = timed_run(dev, cmd)
             except DeviceError as exc:
                 log.error("Tap %d/%d failed: %s", i, count, exc)
             else:
                 if res.ok:
                     done += 1
-                    log.info("Tap %d/%d injected at %s CST.", i, count, stamp)
+                    # the stamp is taken before sending; the event lands up to `latency` later
+                    log.info("Tap %d/%d sent at %s CST, input returned after %.0f ms.",
+                             i, count, stamp, latency)
                 else:
                     log.error("Tap %d/%d rejected: %s", i, count, res.first_line_of_error())
                     if res.security_denied:
@@ -1027,24 +1067,21 @@ def run(args) -> int:
         check_at = target_utc - timedelta(seconds=FINAL_CHECK_SEC)
         if check_at > clock.now():
             wait_until(check_at, clock, dev)
-        button, _xml_before = final_check(dev, args.button_text, report.button,
-                                          need_inject=not args.dry_run)
+        button, xml_before = final_check(dev, args.button_text, report.button,
+                                         need_inject=not args.dry_run)
+        since = device_time(dev)    # logcat window for the post-tap denial check
         wait_until(target_utc, clock, dev)
         done = click(dev, button, clock, args)
+        if not args.dry_run and done:
+            log.info("Keeping the screen on for 5 s while the request loads...")
+            time.sleep(5)
+            if not verify_after_tap(dev, button, args.button_text, xml_before, since):
+                done = 0
         if done == args.clicks:
             log.info("[SUCCESS] %d/%d taps %s.", done, args.clicks,
                      "simulated" if args.dry_run else "injected")
         else:
             log.error("[FAILED] only %d/%d taps were injected.", done, args.clicks)
-        if not args.dry_run and done:
-            log.info("Keeping the screen on for 5 s while the request loads...")
-            time.sleep(5)
-            try:
-                xml = dump_ui(dev, attempts=1)
-                texts = [n.get("text") for n in ET.fromstring(xml).iter("node") if n.get("text")]
-                log.info("Screen text after tapping: %s", " | ".join(texts[:15]))
-            except (DeviceError, ET.ParseError) as exc:
-                log.debug("Post-click dump failed: %s", exc)
     return EXIT_OK if done == args.clicks else EXIT_ERROR
 
 

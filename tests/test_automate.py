@@ -369,3 +369,27 @@ def test_taps_where_the_button_is_at_fire_time(monkeypatch, caplog):
     assert run_with(monkeypatch, dev, ["--test-in", "5", "--clicks", "1"]) == a.EXIT_OK
     assert dev.taps == ["input tap 540 1870"]
     assert "button moved from (540, 2070) to (540, 1870)" in caplog.text
+
+
+def test_unchanged_screen_after_tap_warns(monkeypatch, caplog):
+    dev = FakeDevice()
+    assert run_with(monkeypatch, dev, ["--test-in", "5", "--clicks", "1"]) == a.EXIT_OK
+    assert "Screen unchanged after tapping" in caplog.text
+
+
+def test_new_screen_text_after_tap_is_logged(caplog):
+    caplog.set_level("INFO")
+    dev = FakeDevice(xml=UI_XML.replace("Apply for unlocking", "Applied, come back tomorrow")
+                     .replace('text="20:07"', 'text="00:00"'))
+    button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+    assert a.verify_after_tap(dev, button, "Apply for unlocking", UI_XML, "10-05 20:07:03.000")
+    assert "New on screen: Applied, come back tomorrow" in caplog.text   # no systemui clock
+    assert "Screen changed after tapping" in caplog.text
+
+
+def test_logcat_denial_after_tap_fails():
+    dev = FakeDevice()
+    dev.logcat = LOGCAT_DENIAL
+    button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+    assert not a.verify_after_tap(dev, button, "Apply for unlocking", UI_XML,
+                                  "10-05 20:07:03.000")
