@@ -83,6 +83,7 @@ The shell user is not allowed to inject input (INJECT_EVENTS).
 On Xiaomi / HyperOS this is controlled by a separate developer option:
   Settings -> Additional settings -> Developer options ->
   "USB debugging (Security settings)"  -> ON
+Check: 'adb shell getprop persist.security.adbinput' must print 1.
 Notes:
   * The toggle requires being signed in to a Mi account (and on many builds a SIM card
     inserted + mobile data / internet on while you flip it).
@@ -95,10 +96,9 @@ Notes:
   * Other OEMs: look for "Disable permission monitoring" (ColorOS/realme/OnePlus)."""
 
 SETTINGS_HINT = """\
-The shell user cannot write system settings (WRITE_SECURE_SETTINGS) - on Xiaomi this
-is the same "USB debugging (Security settings)" toggle. The script can still run, but
-the screen may turn off before the target time: set the screen timeout to the maximum
-manually and keep the device plugged in."""
+The shell user cannot write system settings (WRITE_SECURE_SETTINGS). The script can
+still run, but the screen may turn off before the target time: set the screen timeout
+to the maximum manually and keep the device plugged in."""
 
 
 class DeviceError(RuntimeError):
