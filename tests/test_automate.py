@@ -272,7 +272,8 @@ def test_audit_probes_inside_the_app_window(monkeypatch, caplog):
     dev = FakeDevice()
     assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "90"]) == a.EXIT_OK
     assert dev.probe_taps == ["input tap 370 160"] * 2     # audit + T-90 s probe
-    assert "in Mi Community accepted" in caplog.text
+    assert "tap on static text 'Unlock bootloader' at (370, 160) in Mi Community accepted" \
+        in caplog.text
 
 
 def test_no_probe_in_the_last_minute(monkeypatch, caplog):
@@ -280,6 +281,25 @@ def test_no_probe_in_the_last_minute(monkeypatch, caplog):
     assert run_with(monkeypatch, dev, DRY) == a.EXIT_OK
     assert dev.probe_taps == []
     assert "probe skipped: the target is less than a minute away" in caplog.text
+
+
+def test_probes_fit_the_window_with_double_tap_safe_gap(monkeypatch):
+    assert a.PROBE_GAP_SEC >= 0.4
+    dev = FakeDevice()
+    probe_times = []
+    real_run = dev.run
+
+    def run(cmd, timeout=30.0):
+        if cmd.startswith("echo \"miunlock_start="):
+            probe_times.append(a.time.time())
+        return real_run(cmd, timeout)
+    dev.run = run
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
+    assert len(probe_times) == 20
+    gaps = [later - earlier for earlier, later in zip(probe_times, probe_times[1:])]
+    assert min(gaps) >= a.PROBE_GAP_SEC
+    target = VIRTUAL_START + 150                 # --test-in 150 (+ a few virtual ms)
+    assert probe_times[-1] < target - a.PROBE_END_SEC - a.PROBE_SAFETY_SEC
 
 
 @pytest.mark.parametrize("test_in", ["90", "200", "3600"])

@@ -71,7 +71,7 @@ WIDE_SPREAD_MS = 100             # injection delay p95 - min above this is unrel
 WIDE_SPREAD_MARGIN_MS = 150      # ... and gets this margin
 MIN_ARRIVAL_MS = 50              # guard: the request may never arrive before target + this
 DEFAULT_PROBES = 20              # latency probes (taps on static text, never the button)
-PROBE_GAP_SEC = 0.1
+PROBE_GAP_SEC = 0.4              # > double-tap timeout: no zoom / double-tap actions
 ADB_RTT_SAMPLES = 5
 DEFAULT_CACHE_FILE = str(Path(__file__).resolve().with_name("miunlock_latency.json"))
 CACHE_METHOD = "device_inject_v1"   # older caches (round-trip) are not used
@@ -368,6 +368,7 @@ class Button:
     bounds: str
     enabled: bool
     matched_by: str
+    text: str = ""
 
 
 _BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
@@ -408,7 +409,8 @@ def _button_from_node(node: ET.Element, matched_by: str) -> Button | None:
     if x2 <= x1 or y2 <= y1:
         return None    # invisible / zero-size node
     return Button((x1 + x2) // 2, (y1 + y2) // 2, bounds,
-                  node.get("enabled", "true") == "true", matched_by)
+                  node.get("enabled", "true") == "true", matched_by,
+                  (node.get("text") or node.get("content-desc") or "").strip())
 
 
 def find_button(xml_text: str, button_text: str, resource_id: str) -> Button | None:
@@ -725,7 +727,7 @@ def _audit_inject_probe(dev: Device, rep: AuditReport, name: str) -> None:
     elif probe.targeted:
         t = rep.probe_target
         rep.add(name, Status.OK,
-                f"tap on static text at ({t.x}, {t.y}) in Mi Community accepted")
+                f"tap on static text '{t.text}' at ({t.x}, {t.y}) in Mi Community accepted")
     else:
         rep.add(name, Status.WARN, "only an off-screen probe passed",
                 "No static text to tap was found in the Mi Community window, so it is\n"
