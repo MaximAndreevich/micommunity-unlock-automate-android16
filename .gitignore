@@ -74,3 +74,6 @@ miunlock_latency.json.tmp
 # Screenshots / app logcat saved after the tap (automate.py)
 miunlock_*_tap+*.png
 miunlock_*_app_logcat.txt
+
+# hypothesis example database (property-based tests)
+.hypothesis/
