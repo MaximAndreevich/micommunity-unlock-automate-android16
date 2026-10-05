@@ -50,7 +50,7 @@ SETTINGS_EXC = ("Exception occurred while executing 'put':\njava.lang.SecurityEx
 class FakeDevice(a.Device):
     def __init__(self, inject=True, settings=True, focus="com.mi.global.bbs", xml=UI_XML,
                  adbinput=None, brand="Xiaomi", silent_denial=False, inject_ms=70.0,
-                 tap_rt_ms=120.0, inject_log=True):
+                 tap_rt_ms=120.0, inject_log=True, real_tap_inject_ms=None):
         self.serial = "fake123"
         self.inject, self.settings, self.focus, self.xml = inject, settings, focus, xml
         # Xiaomi toggle; follows `inject` unless set explicitly ("" = property missing)
@@ -68,6 +68,8 @@ class FakeDevice(a.Device):
         self.delays = itertools.cycle(inject_ms if isinstance(inject_ms, (list, tuple))
                                       else [inject_ms])
         self.injections = []                 # (command, moment the event was injected)
+        self.real_tap_inject_ms = real_tap_inject_ms   # the button tap's own delay (None:
+                                                       # the next one of inject_ms)
         self.tap_rt_ms = tap_rt_ms           # round-trip of a tap command
         self.inject_log = inject_log         # HyperOS logs every injection (MIUIInput)
         self.broken = ()                     # command prefixes failing with an adb error
@@ -165,8 +167,12 @@ class FakeDevice(a.Device):
     def _timed_tap(self, cmd, timeout):
         """tap_command(): prints the start time, logs the injection like HyperOS."""
         start = a.time.time()
+        button_taps = len(self.taps)
         res = self.run(cmd, timeout)
-        injected = start + next(self.delays) / 1000
+        hit_button = len(self.taps) > button_taps
+        delay = (self.real_tap_inject_ms if hit_button and self.real_tap_inject_ms is not None
+                 else next(self.delays))
+        injected = start + delay / 1000
         if res.returncode == 0 and not self.silent_denial:
             self.injections.append((cmd, injected))
         if res.returncode == 0 and self.inject_log and not self.silent_denial:

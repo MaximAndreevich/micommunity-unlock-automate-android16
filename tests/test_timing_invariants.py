@@ -74,12 +74,8 @@ def test_send_time_does_not_depend_on_the_target_time_zone():
 # The fake phone injects every tap `inject_ms` after the command starts, in virtual
 # time; the real tap must land no earlier than target + margin.
 
-@pytest.mark.parametrize("timing", [[], ["--timing", "fixed"]], ids=["adaptive", "fixed"])
-@pytest.mark.parametrize("inject_ms, tap_rt_ms", [(5, 60), (70, 120), (140, 250),
-                                                  ([90, 70, 130, 75], 200)],
-                         ids=["fast", "typical", "slow", "jitter"])
-def test_real_tap_is_injected_after_target_plus_margin(monkeypatch, inject_ms, tap_rt_ms,
-                                                       timing):
+def real_run(monkeypatch, dev, argv):
+    """A non-dry run; returns the plan, the target, the send moment and the injection."""
     plans = []
     real_log_plan = a.log_plan
 
@@ -87,13 +83,51 @@ def test_real_tap_is_injected_after_target_plus_margin(monkeypatch, inject_ms, t
         plans.append((plan, target_utc, send_utc))
         return real_log_plan(plan, target_utc, send_utc, *rest)
     monkeypatch.setattr(a, "log_plan", spy)
-    dev = FakeDevice(inject_ms=inject_ms, tap_rt_ms=tap_rt_ms)
-    assert run_with(monkeypatch, dev, ["--test-in", "150"] + timing) == a.EXIT_OK
-
+    assert run_with(monkeypatch, dev, ["--test-in", "150"] + argv) == a.EXIT_OK
     [(plan, target, send)] = plans
     [injected] = [datetime.fromtimestamp(t, timezone.utc)
                   for cmd, t in dev.injections if cmd in dev.taps]
+    return plan, target, send, injected
+
+
+@pytest.mark.parametrize("timing", [[], ["--timing", "fixed"]], ids=["adaptive", "fixed"])
+@pytest.mark.parametrize("inject_ms, tap_rt_ms", [(5, 60), (70, 120), (140, 250),
+                                                  ([90, 70, 130, 75], 200)],
+                         ids=["fast", "typical", "slow", "jitter"])
+def test_real_tap_is_injected_after_target_plus_margin(monkeypatch, inject_ms, tap_rt_ms,
+                                                       timing):
+    dev = FakeDevice(inject_ms=inject_ms, tap_rt_ms=tap_rt_ms)
+    plan, target, send, injected = real_run(monkeypatch, dev, timing)
     assert plan.mode == ("fixed" if timing else "adaptive")
     assert injected >= target + ms(plan.margin_ms) >= target + ms(a.MIN_ARRIVAL_MS)
     slowest = max(inject_ms) if isinstance(inject_ms, list) else inject_ms
     assert injected - send <= ms(slowest + 20)       # + the virtual cost of the clock calls
+
+
+# The real tap does not have to be as slow as the probes: on the phone one run measured
+# min 40 ms, another 53 ms. Here the probes see 53-80 ms (the samples of a real run) and
+# the real tap is faster than all of them. Only the margin covers that, so the tap no
+# longer lands after target + margin - but up to `margin` ms faster it is still after
+# the target.
+PROBES_MS = [66.38, 76.38, 63.02, 79.0, 64.44, 53.04, 63.94, 65.94, 73.48, 66.58,
+             73.24, 76.31, 72.76, 66.69, 53.06, 64.38, 74.93, 72.9, 79.56, 64.11]
+
+
+@pytest.mark.parametrize("real_ms", [53.04, 40, 20, 3.5])
+def test_real_tap_faster_than_the_probes_still_lands_after_the_target(monkeypatch, real_ms):
+    dev = FakeDevice(inject_ms=PROBES_MS, tap_rt_ms=130, real_tap_inject_ms=real_ms)
+    plan, target, _, injected = real_run(monkeypatch, dev, [])
+    assert (plan.mode, plan.compensation_ms, plan.margin_ms) == ("adaptive", 53, 50)
+    assert injected >= target
+    # the margin is used up by exactly the difference (+ a few ms of virtual clock calls)
+    expected = target + ms(plan.margin_ms - (min(PROBES_MS) - real_ms))
+    assert expected <= injected <= expected + ms(5)
+
+
+def test_real_tap_faster_than_the_probes_by_more_than_the_margin_is_early(monkeypatch):
+    """The limit of the model, not a wish: nothing but the margin covers a real tap that
+    is faster than every probe, so 130 ms faster with a 50 ms margin is a false start."""
+    dev = FakeDevice(inject_ms=[150, 160, 170], tap_rt_ms=250, real_tap_inject_ms=20)
+    plan, target, _, injected = real_run(monkeypatch, dev, [])
+    assert (plan.compensation_ms, plan.margin_ms) == (149, 50)     # 150 - the resolution
+    assert injected < target - ms(70)
