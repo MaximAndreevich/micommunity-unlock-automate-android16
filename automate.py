@@ -45,7 +45,7 @@ import re
 import statistics
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -1049,6 +1049,8 @@ def save_cache(path: str, serial: str, measured: Measurement, api_host: str | No
         os.replace(tmp, path)
     except OSError as exc:
         log.warning("Could not save the latency cache %s: %s", path, exc)
+        with suppress(OSError):
+            os.remove(tmp)
         return
     log.info("Latency measurement saved to %s.", path)
 
