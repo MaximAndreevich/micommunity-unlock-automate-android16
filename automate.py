@@ -67,7 +67,8 @@ EXIT_OK, EXIT_ERROR, EXIT_AUDIT, EXIT_INTERRUPTED = 0, 1, 2, 130
 
 # Android prints exceptions from shell commands to stdout/stderr and often still exits 0
 _EXCEPTION_RE = re.compile(r"(Exception|Error)( occurred|:)|Permission denial", re.IGNORECASE)
-_SECURITY_RE = re.compile(r"SecurityException|INJECT_EVENTS|WRITE_SECURE_SETTINGS|Permission denial")
+_SECURITY_RE = re.compile(
+    r"SecurityException|INJECT_EVENTS|WRITE_SECURE_SETTINGS|Permission denial")
 
 INJECT_HINT = """\
 The shell user is not allowed to inject input (INJECT_EVENTS).
@@ -124,7 +125,9 @@ class ShellResult:
         for line in lines:
             if _EXCEPTION_RE.search(line):
                 return line.strip()
-        return self.output.strip().splitlines()[0] if self.output.strip() else f"exit code {self.returncode}"
+        if self.output.strip():
+            return self.output.strip().splitlines()[0]
+        return f"exit code {self.returncode}"
 
 
 class Device:
@@ -425,7 +428,7 @@ def probe_settings_write(dev: Device) -> tuple[bool, str]:
     if not cur.ok:
         return False, cur.first_line_of_error()
     value = cur.output.strip()
-    value = "0" if value in ("", "null") else value
+    value = "0" if value in {"", "null"} else value
     res = dev.run(f"settings put global {STAY_ON_KEY} {value}", timeout=10)
     return res.ok, ("" if res.ok else res.first_line_of_error())
 
@@ -473,8 +476,9 @@ def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
 
     adbinput = dev.getprop("persist.security.adbinput")
     if adbinput:
+        state = "ON" if adbinput == "1" else "OFF"
         rep.add("persist.security.adbinput", Status.INFO,
-                f"{adbinput} ({'Security settings ON' if adbinput == '1' else 'Security settings OFF'})")
+                f"{adbinput} (Security settings {state})")
 
     ok, err = probe_settings_write(dev)
     rep.can_write_settings = ok
@@ -516,7 +520,7 @@ def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
         if button is None:
             rep.add("Unlock button", Status.FAIL, f"'{args.button_text}' not found on screen",
                     "Open the 'Unlock bootloader' page. If the app is not in English,\n"
-                    "pass the button label with --button-text, or check --save-dump.")
+                    + "pass the button label with --button-text, or check --save-dump.")
         else:
             rep.button = button
             status = Status.OK if button.enabled else Status.WARN
@@ -580,7 +584,7 @@ class ScreenKeeper:
     def __exit__(self, *_exc) -> None:
         for ns_key, val in self.saved.items():
             ns, key = ns_key.split("/", 1)
-            cmd = (f"settings delete {ns} {key}" if val in ("", "null")
+            cmd = (f"settings delete {ns} {key}" if val in {"", "null"}
                    else f"settings put {ns} {key} {val}")
             try:
                 self.dev.check(cmd, timeout=10)
