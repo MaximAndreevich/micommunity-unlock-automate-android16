@@ -322,6 +322,25 @@ def test_ntp_resync_before_target(monkeypatch, wait_sec, expected_syncs):
     assert clock.t >= target
 
 
+def test_single_click_by_default():
+    args = a.build_parser().parse_args([])
+    assert (args.clicks, args.delay) == (1, 61)
+
+
+@pytest.mark.parametrize("argv", [["--clicks", "2", "--delay", "5"],
+                                  ["--clicks", "3", "--delay", "59.9"]])
+def test_fast_repeat_rejected(argv, capsys):
+    p = a.build_parser()
+    with pytest.raises(SystemExit):
+        a.validate_args(p, p.parse_args(argv))
+    assert "one unlock request per minute" in capsys.readouterr().err
+
+
+def test_delay_ignored_with_single_click():
+    p = a.build_parser()
+    a.validate_args(p, p.parse_args(["--delay", "5"]))
+
+
 def test_click_stops_after_security_denial(monkeypatch, caplog):
     monkeypatch.setattr(a.time, "sleep", lambda s: None)
     dev = FakeDevice(inject=False)

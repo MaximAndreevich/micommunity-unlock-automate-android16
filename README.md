@@ -63,13 +63,17 @@ What the script does:
    (NTP is queried once, not in a loop). Re-checks the device and the Security settings
    toggle every minute. 30 s before firing it dumps the UI again, re-locates the button
    (the app may have restarted or scrolled) and repeats the in-app probe.
-4. Taps the button `--clicks` times and verifies that each tap was really injected
+4. Taps the button once (`--clicks`) and verifies that each tap was really injected
    (Android prints the exception but still exits with code 0, so the old version reported success anyway).
    Logs how long each `input` command took: it starts a JVM on the phone, so the tap lands
    a few hundred ms after the logged time — tune `--lead-ms` with that number.
    5 s later it checks logcat for rejected injections and logs only the new text on screen
    (Xiaomi's reply); an unchanged screen is reported as a warning.
 5. Restores the original screen settings — also on Ctrl+C and on errors.
+
+One tap is the default on purpose: Mi Community accepts one unlock request per minute,
+so a second tap 2 s later is wasted and may land in the dialog opened by the first one.
+With `--clicks > 1` the taps are at least 60 s apart (`--delay`, default 61 s).
 
 Exit codes: `0` ok, `1` runtime error, `2` audit failed, `130` interrupted.
 
@@ -96,8 +100,8 @@ usage: automate.py [-h] [--clicks CLICKS] [--delay DELAY] [--lead-ms LEAD_MS]
                    [--test-timezone TEST_TIMEZONE] [--test-in SEC]
                    [--save-dump FILE] [--log-file FILE] [-v]
 
-  --clicks CLICKS       number of taps (default: 2)
-  --delay DELAY         delay between taps in seconds (default: 2.0)
+  --clicks CLICKS       number of taps (default: 1)
+  --delay DELAY         seconds between taps if --clicks > 1, at least 60 (default: 61)
   --lead-ms LEAD_MS     fire this many ms before the target (default: 200)
   --serial SERIAL       device serial if several devices are connected
   --button-text TEXT    button label (default: 'Apply for unlocking'); resource-id is used as fallback
@@ -124,7 +128,7 @@ python automate.py --dry-run --test-in 5
 
 2. Real tap test in 30 seconds (sends a real request!)
 ```shell
-python automate.py --test-in 30 --clicks 1
+python automate.py --test-in 30
 ```
 
 3. Running the script normally, with a log file

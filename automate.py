@@ -68,6 +68,9 @@ HEARTBEAT_SEC = 60.0             # how often to re-check the device while waitin
 FINAL_CHECK_SEC = 30.0           # last full check (UI dump + probe) this long before firing
 NTP_RESYNC_SEC = 60.0            # re-query NTP this many seconds before firing
 
+MIN_CLICK_DELAY_SEC = 60.0       # the server accepts one unlock request per minute
+DEFAULT_CLICK_DELAY_SEC = 61.0
+
 EXIT_OK, EXIT_ERROR, EXIT_AUDIT, EXIT_INTERRUPTED = 0, 1, 2, 130
 
 # Android prints exceptions from shell commands to stdout/stderr and often still exits 0
@@ -951,11 +954,13 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
                "  automate.py --dry-run --test-in 5   check setup, rehearse in 5 s, no taps\n"
-               "  automate.py --test-in 30 --clicks 1 real tap in 30 s (sends a request!)\n"
+               "  automate.py --test-in 30            real tap in 30 s (sends a request!)\n"
                "  automate.py                         real run at 00:00 CST\n")
-    p.add_argument("--clicks", type=int, default=2, help="number of taps (default: 2)")
-    p.add_argument("--delay", type=float, default=2.0,
-                   help="delay between taps in seconds (default: 2.0)")
+    p.add_argument("--clicks", type=int, default=1, help="number of taps (default: 1)")
+    p.add_argument("--delay", type=float, default=DEFAULT_CLICK_DELAY_SEC,
+                   help="seconds between taps if --clicks > 1, at least "
+                        f"{MIN_CLICK_DELAY_SEC:g}: the server accepts one request per minute "
+                        f"(default: {DEFAULT_CLICK_DELAY_SEC:g})")
     p.add_argument("--lead-ms", type=int, default=DEFAULT_LEAD_MS,
                    help=f"fire this many ms before the target (default: {DEFAULT_LEAD_MS})")
     p.add_argument("--serial", help="device serial if several devices are connected")
@@ -986,8 +991,10 @@ def validate_args(p: argparse.ArgumentParser, args) -> None:
     """Validates argument combinations; exits via p.error() on bad input."""
     if args.clicks < 1:
         p.error("--clicks must be >= 1")
-    if args.delay < 0:
-        p.error("--delay must be >= 0")
+    if args.clicks > 1 and args.delay < MIN_CLICK_DELAY_SEC:
+        p.error(f"--delay must be at least {MIN_CLICK_DELAY_SEC:g} s with --clicks > 1: "
+                "the server accepts one unlock request per minute, a faster repeat is "
+                "wasted and may hit the dialog opened by the first tap")
     if not 0 <= args.lead_ms <= 5000:
         p.error("--lead-ms must be between 0 and 5000")
     if args.test_in is not None:
