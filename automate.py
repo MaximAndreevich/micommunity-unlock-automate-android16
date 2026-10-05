@@ -1348,9 +1348,14 @@ def probe_phase(ses: Session, button: Button) -> Measurement | None:
         return None
 
     deadline = ses.target_utc - timedelta(seconds=PROBE_END_SEC + PROBE_SAFETY_SEC)
-    adb_rtt = measure_adb_rtt(dev) if measure else []
-    probes = measure_tap_latency(dev, target, ses.clock, deadline,
-                                 args.probes if measure else 1)
+    try:
+        adb_rtt = measure_adb_rtt(dev) if measure else []
+        probes = measure_tap_latency(dev, target, ses.clock, deadline,
+                                     args.probes if measure else 1)
+    except DeviceError as exc:
+        # not a denial: the final check decides whether the device is still usable
+        log.warning("Probe: adb failed (%s) - no in-app probe.", exc)
+        return None
     samples = probes.round_trips
     if probes.denial:
         msg = f"input injection is denied: {probes.denial}"
@@ -1455,7 +1460,11 @@ def verify_after_tap(dev: Device, button: Button, button_text: str,
     ok is False if the device rejected them (logcat). An unchanged app screen is no
     error: the reply may have been a toast.
     """
-    denial = logcat_denial(dev, since)
+    try:
+        denial = logcat_denial(dev, since)
+    except DeviceError as exc:
+        log.warning("Could not check logcat for rejected taps: %s", exc)
+        denial = ""
     if denial:
         log.error("The device rejected the taps: %s", denial)
         log.error(INJECT_HINT)
