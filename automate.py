@@ -39,7 +39,7 @@ import re
 import statistics
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -59,15 +59,21 @@ BEIJING_OFFSET = timedelta(hours=8)
 # Send moment = target + margin - compensation. A request that reaches the server before
 # 00:00:00 CST counts for the previous day (quota used up) and blocks the next one for a
 # minute, so every error must make it late, never early: only measured delays are
-# compensated (by their minimum), unmeasured ones count as 0.
+# compensated (by a lower bound), unmeasured ones count as 0.
+# The compensation is the time from the start of the tap command to the injection of the
+# event, both on the device clock (shell start time, then the MIUIInput logcat line). The
+# PC -> device leg counts as 0. The round-trip of `input tap` is NOT used: it also contains
+# the JVM shutdown and the way back, the event is delivered in the middle of it.
 DEFAULT_MARGIN_MS = 150          # fixed mode, and the fallback without a measurement
 DEFAULT_ADAPTIVE_MARGIN_MS = 50  # covers NTP error, network asymmetry, faster-than-min taps
-WIDE_SPREAD_MS = 100             # tap latency p95 - min above this is unreliable ...
+WIDE_SPREAD_MS = 100             # injection delay p95 - min above this is unreliable ...
 WIDE_SPREAD_MARGIN_MS = 150      # ... and gets this margin
 MIN_ARRIVAL_MS = 50              # guard: the request may never arrive before target + this
 DEFAULT_PROBES = 20              # latency probes (taps on static text, never the button)
 PROBE_GAP_SEC = 0.1
+ADB_RTT_SAMPLES = 5
 DEFAULT_CACHE_FILE = str(Path(__file__).resolve().with_name("miunlock_latency.json"))
+CACHE_METHOD = "device_inject_v1"   # older caches (round-trip) are not used
 DEFAULT_CACHE_MAX_AGE_DAYS = 7.0
 NTP_SERVER = "pool.ntp.org"
 NTP_SAMPLES = 4
@@ -108,6 +114,10 @@ _LOGCAT_DENIED_RE = re.compile(
     + r"(permission denied:? injecting|injection (was )?(denied|failed|rejected))",
     re.IGNORECASE)
 _DEVICE_TIME_RE = re.compile(r"\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}")
+# `logcat -v epoch` line of an accepted injection (HyperOS logs DOWN and UP)
+_INJECT_LOG_RE = re.compile(r"^\s*(\d+\.\d+)\s.*\bMIUIInput\b.*injection from package",
+                            re.IGNORECASE)
+_TAP_START_RE = re.compile(r"^miunlock_start=(\d+\.(\d+))\s*$", re.MULTILINE)
 _PING_TIME_RE = re.compile(r"time[=<]\s*(\d+(?:\.\d+)?)\s*ms")
 _HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:-]*")
 
@@ -555,15 +565,65 @@ def device_time(dev: Device) -> str:
     return out if _DEVICE_TIME_RE.fullmatch(out) else ""
 
 
-def logcat_denial(dev: Device, since: str) -> str:
-    """First logcat line since `since` that reports a rejected injection ('' if none)."""
+def read_logcat(dev: Device, since: str) -> str:
+    """logcat since `since` (device_time() format) with epoch time stamps."""
     if not since:
         return ""
-    out = dev.run(f"logcat -d -T '{since}'", timeout=20).output
-    for line in out.splitlines():
+    return dev.run(f"logcat -d -v epoch -T '{since}'", timeout=20).output
+
+
+def find_denial(logcat: str) -> str:
+    """First logcat line that reports a rejected injection ('' if none)."""
+    for line in logcat.splitlines():
         if _LOGCAT_DENIED_RE.search(line):
             return line.strip()[:200]
     return ""
+
+
+def logcat_denial(dev: Device, since: str) -> str:
+    """First logcat line since `since` that reports a rejected injection ('' if none)."""
+    return find_denial(read_logcat(dev, since))
+
+
+def tap_command(x: int, y: int) -> str:
+    """
+    `input tap` preceded by the device clock at its start ($EPOCHREALTIME of mksh,
+    microseconds; `date +%s.%N` otherwise). Probes and the real tap use the same command.
+    """
+    return f'echo "miunlock_start=${{EPOCHREALTIME:-$(date +%s.%N)}}"; input tap {x} {y}'
+
+
+def tap_start(output: str) -> tuple[float, float] | None:
+    """(device time in s, its resolution in s) printed by tap_command, None if missing."""
+    m = _TAP_START_RE.search(output)
+    if not m:
+        return None
+    return float(m.group(1)), 10.0 ** -len(m.group(2))
+
+
+def injection_times(logcat: str) -> list[float]:
+    """Device times (epoch s, truncated to ms by logcat) of the logged injections."""
+    return [float(m.group(1)) for m in map(_INJECT_LOG_RE.search, logcat.splitlines()) if m]
+
+
+def injection_delays(starts: list[tuple[float, float]], injected: list[float]) -> list[float]:
+    """
+    Start -> injection in ms for each tap: the first injection logged after its start and
+    before the next tap's start (the DOWN event). A lower bound of the real delay: logcat
+    truncates its time (earlier), the start is moved later by its resolution, and the
+    time before the shell started (PC -> device) counts as 0. Unmatched taps are left out.
+    """
+    delays = []
+    for i, (start, resolution) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else math.inf
+        first_ms = math.floor(start * 1000) / 1000
+        hits = [t for t in injected if first_ms <= t < end]
+        if not hits:
+            continue
+        delay = (min(hits) - start - resolution) * 1000
+        if delay >= 0:
+            delays.append(delay)
+    return delays
 
 
 def timed_run(dev: Device, cmd: str) -> tuple[ShellResult, float]:
@@ -810,34 +870,69 @@ class LatencyStats:
 
 @dataclass
 class Measurement:
-    """Measured delays: input tap round-trip, optionally the network RTT to the API host."""
-    click: LatencyStats
-    net: LatencyStats | None = None
+    """
+    Measured delays. `inject` (tap command start -> injection, device clock) is
+    compensated; the round-trips are logged and only used for a sanity check.
+    """
+    inject: LatencyStats
+    round_trip: LatencyStats              # `input tap` round-trip seen from the PC
+    adb_rtt: LatencyStats | None = None   # `echo` round-trip seen from the PC
+    net: LatencyStats | None = None       # ping from the phone to --api-host
 
 
-def measure_click_latency(dev: Device, target: Button, clock: Clock, deadline: datetime,
-                          count: int) -> tuple[list[float], str]:
+@dataclass
+class ProbeRun:
+    """Raw result of the latency probes."""
+    round_trips: list[float] = field(default_factory=list)
+    inject_delays: list[float] = field(default_factory=list)
+    denial: str = ""
+
+
+def measure_adb_rtt(dev: Device) -> list[float]:
+    """Round-trips in ms of a trivial shell command."""
+    samples = []
+    for _ in range(ADB_RTT_SAMPLES):
+        res, rtt = timed_run(dev, "echo ok")
+        if res.output.strip() == "ok":
+            samples.append(rtt)
+    return samples
+
+
+def measure_tap_latency(dev: Device, target: Button, clock: Clock, deadline: datetime,
+                        count: int) -> ProbeRun:
     """
     Times `count` taps on static text of the Mi Community window (never the button),
-    stopping at `deadline`. Returns the round-trips in ms and a denial ('' if none).
+    stopping at `deadline`: the round-trip on the PC and start -> injection on the device.
+    Then logcat is scanned for the injections and for a denial.
     """
     since = device_time(dev)
-    samples: list[float] = []
+    run_ = ProbeRun()
+    starts: list[tuple[float, float]] = []
     for _ in range(count):
         if clock.now() >= deadline:
             log.warning("Latency probes stopped by the deadline after %d/%d.",
-                        len(samples), count)
+                        len(run_.round_trips), count)
             break
-        res, latency = timed_run(dev, f"input tap {target.x} {target.y}")
+        res, latency = timed_run(dev, tap_command(target.x, target.y))
         if res.security_denied:
-            return samples, res.first_line_of_error()
+            run_.denial = res.first_line_of_error()
+            return run_
         if res.ok:
-            samples.append(latency)
+            run_.round_trips.append(latency)
+            start = tap_start(res.output)
+            if start:
+                starts.append(start)
         else:
             log.debug("Latency probe failed: %s", res.first_line_of_error())
         time.sleep(PROBE_GAP_SEC)
     time.sleep(0.3)    # let InputDispatcher deliver (and log) the last event
-    return samples, logcat_denial(dev, since)
+    logcat = read_logcat(dev, since)
+    run_.denial = find_denial(logcat)
+    run_.inject_delays = injection_delays(starts, injection_times(logcat))
+    if len(run_.inject_delays) < len(run_.round_trips):
+        log.debug("Injection time found for %d/%d probes (start time printed for %d).",
+                  len(run_.inject_delays), len(run_.round_trips), len(starts))
+    return run_
 
 
 def measure_network_rtt(dev: Device, host: str, count: int, budget_sec: float) -> list[float]:
@@ -864,8 +959,7 @@ def connection_type(serial: str) -> str:
 class CachedLatency:
     """A measurement saved by an earlier run."""
     measured_at: datetime
-    tap: LatencyStats
-    net: LatencyStats | None
+    measured: Measurement
     api_host: str | None
 
 
@@ -875,7 +969,9 @@ def _stats_to_json(stats: LatencyStats) -> dict:
             "p95_ms": round(stats.p95, 2)}
 
 
-def _stats_from_json(obj: dict) -> LatencyStats:
+def _stats_from_json(obj: dict | None) -> LatencyStats | None:
+    if not obj:
+        return None
     samples = [float(x) for x in obj["samples_ms"]]
     if not samples or not all(math.isfinite(x) and x >= 0 for x in samples):
         raise ValueError("bad samples_ms")
@@ -885,9 +981,12 @@ def _stats_from_json(obj: dict) -> LatencyStats:
 def save_cache(path: str, serial: str, measured: Measurement, api_host: str | None,
                now: datetime) -> None:
     """Saves a successful measurement (never fails the run)."""
-    data = {"serial": serial, "connection": connection_type(serial),
-            "measured_at": now.isoformat(), "tap": _stats_to_json(measured.click),
-            "net": _stats_to_json(measured.net) if measured.net else None,
+    def opt(stats: LatencyStats | None) -> dict | None:
+        return _stats_to_json(stats) if stats else None
+    data = {"method": CACHE_METHOD, "serial": serial, "connection": connection_type(serial),
+            "measured_at": now.isoformat(), "inject": _stats_to_json(measured.inject),
+            "round_trip": _stats_to_json(measured.round_trip),
+            "adb_rtt": opt(measured.adb_rtt), "net": opt(measured.net),
             "api_host": api_host if measured.net else None}
     tmp = path + ".tmp"
     try:
@@ -900,12 +999,8 @@ def save_cache(path: str, serial: str, measured: Measurement, api_host: str | No
     log.info("Latency measurement saved to %s.", path)
 
 
-def load_cache(path: str, serial: str, max_age_days: float,
-               now: datetime) -> CachedLatency | None:
-    """
-    The saved measurement if it is for this device and connection type and not too old.
-    A broken file is ignored with a warning.
-    """
+def _read_cache_file(path: str) -> dict | None:
+    """Parsed cache file; None (logged) if missing, unreadable or of an older method."""
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -915,10 +1010,34 @@ def load_cache(path: str, serial: str, max_age_days: float,
     except (OSError, ValueError) as exc:
         log.warning("Latency cache %s is unreadable (%s) - ignored.", path, exc)
         return None
+    if not isinstance(data, dict):
+        log.warning("Latency cache %s is broken (not an object) - ignored.", path)
+        return None
+    if data.get("method") != CACHE_METHOD:
+        log.info("Latency cache %s has an old measurement format (%s) - not used.", path,
+                 data.get("method", "input round-trip"))
+        return None
+    return data
+
+
+def load_cache(path: str, serial: str, max_age_days: float,
+               now: datetime) -> CachedLatency | None:
+    """
+    The saved measurement if it is for this device and connection type and not too old.
+    A broken file is ignored with a warning.
+    """
+    data = _read_cache_file(path)
+    if data is None:
+        return None
     try:
+        inject, round_trip = _stats_from_json(data["inject"]), _stats_from_json(data["round_trip"])
+        if inject is None or round_trip is None:
+            raise ValueError("no samples")
         cached = CachedLatency(
-            datetime.fromisoformat(data["measured_at"]), _stats_from_json(data["tap"]),
-            _stats_from_json(data["net"]) if data.get("net") else None, data.get("api_host"))
+            datetime.fromisoformat(data["measured_at"]),
+            Measurement(inject, round_trip, _stats_from_json(data.get("adb_rtt")),
+                        _stats_from_json(data.get("net"))),
+            data.get("api_host"))
         age = now - cached.measured_at      # TypeError if measured_at has no time zone
         same_device = (data["serial"], data["connection"]) == (serial, connection_type(serial))
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
@@ -941,16 +1060,15 @@ class TimingPlan:
     mode: str                       # "adaptive" or "fixed"
     margin_ms: int
     source: str
-    click: LatencyStats | None = None
-    net: LatencyStats | None = None
+    measured: Measurement | None = None
 
     @property
     def compensation_ms(self) -> int:
         """Measured delays only, by their minimum; rounded down (later is safe)."""
-        if self.mode != "adaptive" or self.click is None:
+        if self.mode != "adaptive" or self.measured is None:
             return 0
-        net = self.net.min / 2 if self.net else 0.0
-        return math.floor(self.click.min + net)
+        net = self.measured.net.min / 2 if self.measured.net else 0.0
+        return math.floor(self.measured.inject.min + net)
 
     def send_time(self, target_utc: datetime) -> datetime:
         """Moment to run the input command."""
@@ -961,22 +1079,21 @@ class TimingPlan:
         return self.send_time(target_utc) + timedelta(milliseconds=self.compensation_ms)
 
 
-def plan_timing(args, tap: LatencyStats | None, net: LatencyStats | None,
-                source: str) -> TimingPlan:
+def plan_timing(args, measured: Measurement | None, source: str) -> TimingPlan:
     """Picks the margin and compensation for --timing."""
     if args.timing == "fixed":
         return TimingPlan("fixed", args.margin_ms, "--timing fixed")
-    if tap is None:
+    if measured is None:
         log.warning("Latency estimate impossible - using the standard margin of %d ms.",
                     args.margin_ms)
         return TimingPlan("fixed", args.margin_ms, "no latency estimate")
     margin = args.adaptive_margin_ms
-    spread = tap.p95 - tap.min
+    spread = measured.inject.p95 - measured.inject.min
     if spread > WIDE_SPREAD_MS:
         margin = max(margin, WIDE_SPREAD_MARGIN_MS)
-        log.warning("Tap latency varies a lot (p95 - min = %.0f ms > %d ms) - margin %d ms.",
-                    spread, WIDE_SPREAD_MS, margin)
-    return TimingPlan("adaptive", margin, source, tap, net)
+        log.warning("Injection delay varies a lot (p95 - min = %.0f ms > %d ms) - "
+                    + "margin %d ms.", spread, WIDE_SPREAD_MS, margin)
+    return TimingPlan("adaptive", margin, source, measured)
 
 
 def checked_send_time(plan: TimingPlan, target_utc: datetime) -> tuple[TimingPlan, datetime]:
@@ -1004,11 +1121,16 @@ def log_plan(plan: TimingPlan, target_utc: datetime, send_utc: datetime,
              api_host: str | None) -> None:
     """Logs the chosen timing and where the numbers come from."""
     log.info("Timing: %s (%s)", plan.mode, plan.source)
-    if plan.click:
-        log.info("  tap latency: %s", plan.click.describe())
-    if plan.net:
-        log.info("  network RTT to %s: %s (half of min compensated)", api_host,
-                 plan.net.describe())
+    m = plan.measured
+    if m:
+        log.info("  start -> injection (device clock): %s", m.inject.describe())
+        log.info("  input tap round-trip (reference, not compensated): %s",
+                 m.round_trip.describe())
+        if m.adb_rtt:
+            log.info("  ADB round-trip: %s", m.adb_rtt.describe())
+        if m.net:
+            log.info("  network RTT to %s: %s (half of min compensated)", api_host,
+                     m.net.describe())
     log.info("  compensation %d ms, margin %d ms", plan.compensation_ms, plan.margin_ms)
     log.info("  send at %s CST / %s local", fmt_time(send_utc, BEIJING_OFFSET),
              fmt_time(send_utc))
@@ -1138,10 +1260,12 @@ def probe_phase(ses: Session, button: Button) -> Measurement | None:
         return None
 
     deadline = ses.target_utc - timedelta(seconds=PROBE_END_SEC + PROBE_SAFETY_SEC)
-    samples, denial = measure_click_latency(dev, target, ses.clock, deadline,
-                                            args.probes if measure else 1)
-    if denial:
-        msg = f"input injection is denied: {denial}"
+    adb_rtt = measure_adb_rtt(dev) if measure else []
+    probes = measure_tap_latency(dev, target, ses.clock, deadline,
+                                 args.probes if measure else 1)
+    samples = probes.round_trips
+    if probes.denial:
+        msg = f"input injection is denied: {probes.denial}"
         if not args.dry_run:
             raise DeviceError("device not ready for clicking: " + msg)
         log.error("Probe: %s", msg)
@@ -1152,15 +1276,30 @@ def probe_phase(ses: Session, button: Button) -> Measurement | None:
         else:
             log.warning("Probe inconclusive: the in-app tap failed.")
         return None
+    return _measurement(ses, probes, adb_rtt, deadline)
 
+
+def _measurement(ses: Session, probes: ProbeRun, adb_rtt: list[float],
+                 deadline: datetime) -> Measurement | None:
+    """Measurement from the probes; None (logged) if there are too few samples."""
+    args, samples = ses.args, probes.round_trips
     needed = max(3, args.probes // 2)
     if len(samples) < needed:
         log.warning("Latency measurement inconclusive: %d/%d probes succeeded (need %d).",
                     len(samples), args.probes, needed)
         return None
-    tap = LatencyStats(samples)
-    log.info("Tap latency measured: %s", tap.describe())
-    return Measurement(tap, _probe_network(ses, deadline) if args.api_host else None)
+    round_trip = LatencyStats(samples)
+    log.info("Input tap round-trip (reference, not compensated): %s", round_trip.describe())
+    if len(probes.inject_delays) < needed:
+        log.warning("Latency measurement impossible: the injection time was found for %d/%d "
+                    + "probes (need %d; start time on the device + MIUIInput 'injection "
+                    + "from package' line in logcat).", len(probes.inject_delays),
+                    len(samples), needed)
+        return None
+    inject = LatencyStats(probes.inject_delays)
+    log.info("Start -> injection measured (device clock): %s", inject.describe())
+    return Measurement(inject, round_trip, LatencyStats(adb_rtt) if adb_rtt else None,
+                       _probe_network(ses, deadline) if args.api_host else None)
 
 
 def _probe_network(ses: Session, deadline: datetime) -> LatencyStats | None:
@@ -1255,7 +1394,7 @@ def verify_after_tap(dev: Device, button: Button, button_text: str,
 
 def click(dev: Device, button: Button, clock: Clock, args) -> int:
     """Taps args.clicks times. Returns the number of taps injected successfully."""
-    cmd = f"input tap {button.x} {button.y}"
+    cmd = tap_command(button.x, button.y)
     count = args.clicks
     done = 0
     for i in range(1, count + 1):
@@ -1461,30 +1600,30 @@ def run(args) -> int:
 
 
 def latency_estimate(ses: Session, measured: Measurement | None
-                     ) -> tuple[LatencyStats | None, LatencyStats | None, str]:
+                     ) -> tuple[Measurement | None, str]:
     """
     Fresh measurement (saved to the cache), else a valid cached one, else nothing.
-    Returns tap latency, network RTT and where they come from.
+    Returns the measurement and where it comes from.
     """
     args = ses.args
     if args.timing != "adaptive":
-        return None, None, ""
+        return None, ""
     path = None if args.no_cache else args.cache_file
     if measured:
         if path:
             save_cache(path, ses.dev.serial, measured, args.api_host, ses.clock.now())
-        return measured.click, measured.net, "measured"
+        return measured, "measured"
     cached = (load_cache(path, ses.dev.serial, args.cache_max_age_days, ses.clock.now())
               if path else None)
     if cached is None:
-        return None, None, ""          # plan_timing warns about the standard margin
+        return None, ""                # plan_timing warns about the standard margin
     stamp = cached.measured_at.astimezone().strftime("%Y-%m-%d %H:%M")
     log.warning("Latency measurement not possible - using the one saved on %s.", stamp)
-    net = cached.net if args.api_host and cached.api_host == args.api_host else None
+    net = cached.measured.net if args.api_host and cached.api_host == args.api_host else None
     if args.api_host and net is None:
         log.warning("No saved ping to %s - the network delay is not compensated.",
                     args.api_host)
-    return cached.tap, net, f"cache from {stamp}"
+    return replace(cached.measured, net=net), f"cache from {stamp}"
 
 
 def fire(ses: Session, button: Button) -> int:

@@ -4,6 +4,8 @@ Run: python -m pytest -q tests
 """
 
 import json
+import math
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -56,7 +58,8 @@ def cache_file(tmp_path, monkeypatch):
 
 class FakeDevice(a.Device):
     def __init__(self, inject=True, settings=True, focus="com.mi.global.bbs", xml=UI_XML,
-                 adbinput=None, brand="Xiaomi", silent_denial=False):
+                 adbinput=None, brand="Xiaomi", silent_denial=False, inject_ms=70.0,
+                 tap_rt_ms=120.0, inject_log=True):
         self.serial = "fake123"
         self.inject, self.settings, self.focus, self.xml = inject, settings, focus, xml
         # Xiaomi toggle; follows `inject` unless set explicitly ("" = property missing)
@@ -70,9 +73,16 @@ class FakeDevice(a.Device):
         self.taps = []
         self.commands = []
         self.ping_output = ""                # "" = ping not available
+        self.inject_ms = inject_ms           # command start -> injection (device clock)
+        self.tap_rt_ms = tap_rt_ms           # round-trip of a tap command
+        self.inject_log = inject_log         # HyperOS logs every injection (MIUIInput)
 
     def run(self, cmd, timeout=30.0):
         self.commands.append(cmd)
+        tap = re.fullmatch(r'echo "miunlock_start=\$\{EPOCHREALTIME:-\$\(date \+%s\.%N\)\}"; '
+                           r'(input tap .*)', cmd)
+        if tap:
+            return self._timed_tap(tap.group(1), timeout)
         out, rc = "", 0
         if cmd == "echo ok":
             out = "ok"
@@ -125,6 +135,17 @@ class FakeDevice(a.Device):
             out = self.xml
         return a.ShellResult(cmd, rc, out)
 
+    def _timed_tap(self, cmd, timeout):
+        """tap_command(): prints the start time, logs the injection like HyperOS."""
+        start = a.time.time()
+        res = self.run(cmd, timeout)
+        if res.returncode == 0 and self.inject_log and not self.silent_denial:
+            logged = math.floor((start + self.inject_ms / 1000) * 1000) / 1000   # truncated
+            self.logcat += (f"{logged:.3f}  2678 13244 W MIUIInput: Input motion event "
+                            "injection from package: null action ACTION_DOWN\n")
+        a.time.sleep(self.tap_rt_ms / 1000)
+        return a.ShellResult(cmd, res.returncode, f"miunlock_start={start:.6f}\n" + res.output)
+
 
 VIRTUAL_START = 1_800_000_000.0
 
@@ -141,6 +162,7 @@ def use_virtual_time(monkeypatch):
         now[0] += sec
     monkeypatch.setattr(a.time, "time", fake_time)
     monkeypatch.setattr(a.time, "monotonic", fake_time)
+    monkeypatch.setattr(a.time, "perf_counter", fake_time)
     monkeypatch.setattr(a.time, "sleep", fake_sleep)
 
 
@@ -505,10 +527,16 @@ def test_logcat_denial_after_tap_fails():
 T0 = datetime(2026, 10, 6, 16, 0, tzinfo=timezone.utc)      # 00:00:00 CST
 
 
-def plan_for(argv, samples=None, net=None):
+def measurement(inject, round_trip=None, adb=None, net=None):
+    stats = a.LatencyStats
+    return a.Measurement(stats(inject), stats(round_trip or [x + 50 for x in inject]),
+                         stats(adb) if adb else None, stats(net) if net else None)
+
+
+def plan_for(argv, samples=None, net=None, round_trip=None, adb=None):
     args = a.build_parser().parse_args(argv)
-    tap = a.LatencyStats(samples) if samples else None
-    plan = a.plan_timing(args, tap, a.LatencyStats(net) if net else None, "test")
+    measured = measurement(samples, round_trip, adb, net) if samples else None
+    plan = a.plan_timing(args, measured, "test")
     return a.checked_send_time(plan, T0)
 
 
@@ -524,7 +552,25 @@ def test_fixed_timing_sends_at_150_ms():
         == "00:00:00.150000"
 
 
-def test_adaptive_compensates_minimal_tap_latency():
+def test_injection_delay_is_a_lower_bound():
+    # start known to 1 us (EPOCHREALTIME), injection logged 70 ms later (truncated to ms)
+    starts = [(100.0, 1e-6), (100.5, 1e-6)]
+    delays = a.injection_delays(starts, [100.070, 100.076, 100.583, 100.589])
+    assert delays == pytest.approx([69.999, 82.999])
+    # /proc/uptime-like start resolution of 10 ms is subtracted in full
+    assert a.injection_delays([(100.0, 0.01)], [100.070]) == pytest.approx([60.0])
+    # no injection logged after the start, or one before it: no sample
+    assert a.injection_delays([(100.0, 1e-6)], [99.990]) == []
+
+
+def test_tap_start_parsing():
+    assert a.tap_start("miunlock_start=1791228293.267669\n") == \
+        pytest.approx((1791228293.267669, 1e-6))
+    assert a.tap_start("miunlock_start=1791228317.N") is None     # date without %N
+    assert a.tap_start("") is None
+
+
+def test_adaptive_compensates_minimal_injection_delay():
     plan, send = plan_for([], samples=[120, 125, 140])
     assert (plan.mode, plan.margin_ms, plan.compensation_ms) == ("adaptive", 50, 120)
     assert send == T0 + ms(50) - ms(120)
@@ -548,7 +594,7 @@ def test_wide_spread_raises_margin(caplog):
     plan, send = plan_for([], samples=[100, 110, 120, 400])
     assert plan.margin_ms == 150
     assert send == T0 + ms(150) - ms(100)
-    assert "Tap latency varies a lot" in caplog.text
+    assert "Injection delay varies a lot" in caplog.text
 
 
 def test_no_estimate_falls_back_to_standard_margin(caplog):
@@ -585,9 +631,41 @@ def test_adaptive_run_measures_in_the_probe_window(monkeypatch, caplog):
     assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
     assert len(dev.probe_taps) == 1 + 20         # audit + latency probes
     assert dev.taps == []                        # dry run: no real tap
-    assert "Tap latency measured" in caplog.text
+    assert "Start -> injection measured (device clock): min 69" in caplog.text
     assert "Timing: adaptive (measured)" in caplog.text
     assert "request reaches the server no earlier than" in caplog.text
+
+
+def test_compensation_is_injection_delay_not_round_trip(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    dev = FakeDevice(inject_ms=70, tap_rt_ms=120)
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
+    assert "input tap round-trip (reference, not compensated): min 12" in caplog.text
+    assert "compensation 69 ms, margin 50 ms" in caplog.text   # 70 ms - 1 us resolution
+
+
+def test_no_injection_line_uses_standard_margin(monkeypatch, caplog, cache_file):
+    dev = FakeDevice(inject_log=False)
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
+    assert "Latency measurement impossible: the injection time was found for 0/20" \
+        in caplog.text
+    assert "using the standard margin of 150 ms" in caplog.text
+    assert any(r.levelname == "WARNING" and "Latency measurement impossible" in r.getMessage()
+               for r in caplog.records)
+    assert not cache_file.exists()
+
+
+def test_start_time_missing_uses_standard_margin(monkeypatch, caplog, cache_file):
+    dev = FakeDevice()
+    real_run = dev.run
+
+    def run(cmd, timeout=30.0):
+        res = real_run(cmd, timeout)
+        return a.ShellResult(cmd, res.returncode, res.output.replace("miunlock_start=", ""))
+    dev.run = run
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
+    assert "using the standard margin of 150 ms" in caplog.text
+    assert not cache_file.exists()
 
 
 def test_adaptive_run_pings_api_host(monkeypatch, caplog):
@@ -598,7 +676,7 @@ def test_adaptive_run_pings_api_host(monkeypatch, caplog):
     argv = ["--dry-run", "--test-in", "150", "--api-host", "example.org"]
     assert run_with(monkeypatch, dev, argv) == a.EXIT_OK
     assert "Network RTT to example.org measured: min 40" in caplog.text
-    assert "compensation 20 ms" in caplog.text   # tap latency ~0 ms in the fake
+    assert "compensation 89 ms" in caplog.text   # 69 ms injection + 40 / 2
 
 
 def test_unavailable_ping_is_not_compensated(monkeypatch, caplog):
@@ -606,7 +684,7 @@ def test_unavailable_ping_is_not_compensated(monkeypatch, caplog):
     argv = ["--dry-run", "--test-in", "150", "--api-host", "example.org"]
     assert run_with(monkeypatch, FakeDevice(), argv) == a.EXIT_OK
     assert "ping example.org from the phone is not available" in caplog.text
-    assert "compensation 0 ms, margin 50 ms" in caplog.text
+    assert "compensation 69 ms, margin 50 ms" in caplog.text
 
 
 def test_late_start_does_not_measure(monkeypatch, caplog):
@@ -634,20 +712,26 @@ def test_failed_probes_are_inconclusive(monkeypatch, caplog):
 # --------------------------------------------------------------------------- cache
 
 def write_cache(path, serial="fake123", connection="usb", age=timedelta(hours=1),
-                samples=(120, 125, 140), now=None):
+                samples=(70, 75, 90), now=None, method=a.CACHE_METHOD):
     now = now or datetime.fromtimestamp(VIRTUAL_START, timezone.utc)
-    path.write_text(json.dumps({
-        "serial": serial, "connection": connection,
-        "measured_at": (now - age).isoformat(),
-        "tap": {"samples_ms": list(samples)}, "net": None, "api_host": None}))
+    data = {"serial": serial, "connection": connection,
+            "measured_at": (now - age).isoformat(),
+            "inject": {"samples_ms": list(samples)},
+            "round_trip": {"samples_ms": [x + 50 for x in samples]},
+            "adb_rtt": {"samples_ms": [4, 5, 6]}, "net": None, "api_host": None}
+    if method:
+        data["method"] = method
+    path.write_text(json.dumps(data))
 
 
 def test_measurement_is_saved(monkeypatch, cache_file):
     assert run_with(monkeypatch, FakeDevice(), ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
     data = json.loads(cache_file.read_text())
-    assert (data["serial"], data["connection"]) == ("fake123", "usb")
-    assert len(data["tap"]["samples_ms"]) == 20
-    assert {"min_ms", "median_ms", "p95_ms"} <= data["tap"].keys()
+    assert (data["method"], data["serial"], data["connection"]) == \
+        ("device_inject_v1", "fake123", "usb")
+    assert len(data["inject"]["samples_ms"]) == len(data["round_trip"]["samples_ms"]) == 20
+    assert len(data["adb_rtt"]["samples_ms"]) == 5
+    assert {"min_ms", "median_ms", "p95_ms"} <= data["inject"].keys()
     assert datetime.fromisoformat(data["measured_at"]).tzinfo is not None
 
 
@@ -666,8 +750,19 @@ def test_late_start_uses_cache(monkeypatch, caplog, cache_file):
     dev = FakeDevice()
     assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "30"]) == a.EXIT_OK
     assert "Latency measurement not possible - using the one saved on" in caplog.text
-    assert "compensation 120 ms, margin 50 ms" in caplog.text
+    assert "compensation 70 ms, margin 50 ms" in caplog.text
     assert dev.probe_taps == []
+
+
+def test_old_round_trip_cache_is_not_used(monkeypatch, caplog, cache_file):
+    caplog.set_level("INFO")
+    now = datetime.fromtimestamp(VIRTUAL_START, timezone.utc)
+    cache_file.write_text(json.dumps({          # the format of the previous version
+        "serial": "fake123", "connection": "usb", "measured_at": now.isoformat(),
+        "tap": {"samples_ms": [109.26, 148.1]}, "net": None, "api_host": None}))
+    assert run_with(monkeypatch, FakeDevice(), ["--dry-run", "--test-in", "30"]) == a.EXIT_OK
+    assert "has an old measurement format (input round-trip) - not used" in caplog.text
+    assert "using the standard margin of 150 ms" in caplog.text
 
 
 def test_no_cache_flag(monkeypatch, caplog, cache_file):
@@ -684,7 +779,7 @@ def test_no_cache_flag(monkeypatch, caplog, cache_file):
 def test_cache_used_only_for_the_same_device_and_fresh(cache_file):
     now = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
     write_cache(cache_file, now=now, age=timedelta(days=6, hours=23))
-    assert a.load_cache(str(cache_file), "fake123", 7, now).tap.min == 120
+    assert a.load_cache(str(cache_file), "fake123", 7, now).measured.inject.min == 70
     for kwargs in ({"serial": "other"}, {"connection": "tcp"},
                    {"age": timedelta(days=7, minutes=1)}, {"age": -timedelta(days=1)}):
         write_cache(cache_file, now=now, **kwargs)
@@ -699,13 +794,17 @@ def test_tcp_cache_matches_tcp_serial(cache_file):
     assert a.connection_type("a1b2c3d4") == "usb"
 
 
-@pytest.mark.parametrize("content", ["{not json", "[]", '{"serial": "fake123"}',
-                                     '{"serial": "fake123", "connection": "usb", '
-                                     '"measured_at": "2026-10-06T10:00:00", '
-                                     '"tap": {"samples_ms": [100]}}',
-                                     '{"serial": "fake123", "connection": "usb", '
+V1 = '"method": "device_inject_v1", '
+SAMPLES = '"inject": {"samples_ms": [70]}, "round_trip": {"samples_ms": [120]}'
+
+
+@pytest.mark.parametrize("content", ["{not json", "[]", '{' + V1 + '"serial": "fake123"}',
+                                     '{' + V1 + '"serial": "fake123", "connection": "usb", '
+                                     '"measured_at": "2026-10-06T10:00:00", ' + SAMPLES + '}',
+                                     '{' + V1 + '"serial": "fake123", "connection": "usb", '
                                      '"measured_at": "2026-10-06T10:00:00+00:00", '
-                                     '"tap": {"samples_ms": []}}'])
+                                     '"inject": {"samples_ms": []}, '
+                                     '"round_trip": {"samples_ms": [120]}}'])
 def test_broken_cache_is_ignored(cache_file, caplog, content):
     cache_file.write_text(content)
     now = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
