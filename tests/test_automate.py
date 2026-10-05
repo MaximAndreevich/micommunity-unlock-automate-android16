@@ -183,3 +183,30 @@ def test_settings_restored_on_interrupt(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         run_with(monkeypatch, dev, ["--test-in", "5"])
     assert dev.store["system/screen_off_timeout"] == "30000"
+
+
+class FakeClock(a.Clock):
+    """Virtual clock: sleep() advances it, every now() call costs 1 ms."""
+
+    def __init__(self):  # pylint: disable=super-init-not-called
+        self.server, self.offset, self.synced = "fake", 0.0, True
+        self.t = datetime(2026, 10, 5, 15, 0, tzinfo=timezone.utc)
+        self.syncs = 0
+
+    def sync(self):
+        self.syncs += 1
+
+    def now(self):
+        self.t += timedelta(milliseconds=1)
+        return self.t
+
+
+@pytest.mark.parametrize("wait_sec, expected_syncs", [(600, 1), (50, 0)])
+def test_ntp_resync_before_target(monkeypatch, wait_sec, expected_syncs):
+    clock = FakeClock()
+    monkeypatch.setattr(a.time, "sleep",
+                        lambda s: setattr(clock, "t", clock.t + timedelta(seconds=s)))
+    target = clock.t + timedelta(seconds=wait_sec)
+    a.wait_until(target, clock, FakeDevice(), need_inject=True)
+    assert clock.syncs == expected_syncs
+    assert clock.t >= target

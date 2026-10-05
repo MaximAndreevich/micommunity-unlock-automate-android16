@@ -61,6 +61,7 @@ SCREEN_TIMEOUT_MAX = "2147483647"
 
 HEARTBEAT_SEC = 60.0             # how often to re-check the device while waiting
 FINAL_CHECK_SEC = 20.0           # last full check this many seconds before firing
+NTP_RESYNC_SEC = 60.0            # re-query NTP this many seconds before firing
 
 EXIT_OK, EXIT_ERROR, EXIT_AUDIT, EXIT_INTERRUPTED = 0, 1, 2, 130
 
@@ -205,7 +206,10 @@ def connect_device(serial: str | None) -> Device:
 # --------------------------------------------------------------------------- clock
 
 class Clock:
-    """NTP-corrected wall clock. NTP is queried once (several samples), not in a loop."""
+    """
+    NTP-corrected wall clock. NTP is queried at startup and once more shortly before
+    the target (several samples each time), never in a loop.
+    """
 
     def __init__(self, server: str, use_ntp: bool = True) -> None:
         self.server = server
@@ -226,6 +230,10 @@ class Clock:
                 errors.append(str(exc))
             time.sleep(0.2)
         if not samples:
+            if self.synced:
+                log.warning("NTP %s resync failed (%s) - keeping offset %+.3f s.",
+                            self.server, errors[-1] if errors else "?", self.offset)
+                return
             log.warning("NTP %s unreachable (%s) - using the local clock.",
                         self.server, errors[-1] if errors else "?")
             self.synced = False
@@ -606,12 +614,20 @@ def wait_until(target_utc: datetime, clock: Clock, dev: Device, need_inject: boo
     log.info("Waiting %s until %s UTC.", timedelta(seconds=int(remaining)),
              target_utc.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
 
+    # one more NTP sync before firing: the PC clock may drift or get adjusted by the OS
+    # during a wait of several hours; skipped for short waits (the startup sync is fresh)
+    resync_pending = clock.synced and remaining > NTP_RESYNC_SEC + 30
     final_checked = False
     next_heartbeat = time.monotonic() + HEARTBEAT_SEC
     while True:
         remaining = (target_utc - clock.now()).total_seconds()
         if remaining <= 0:
             return
+
+        if resync_pending and remaining <= NTP_RESYNC_SEC:
+            resync_pending = False
+            clock.sync()
+            continue
 
         if not final_checked and remaining <= FINAL_CHECK_SEC:
             final_checked = True
