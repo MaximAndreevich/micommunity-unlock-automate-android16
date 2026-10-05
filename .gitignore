@@ -70,3 +70,7 @@ poetry.lock
 # Latency measurement cache (automate.py)
 miunlock_latency.json
 miunlock_latency.json.tmp
+
+# Screenshots / app logcat saved after the tap (automate.py)
+miunlock_*_tap+*.png
+miunlock_*_app_logcat.txt

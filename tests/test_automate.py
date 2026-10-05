@@ -51,6 +51,7 @@ SETTINGS_EXC = ("Exception occurred while executing 'put':\njava.lang.SecurityEx
 @pytest.fixture(autouse=True)
 def cache_file(tmp_path, monkeypatch):
     """Keeps tests away from the real latency cache next to the script."""
+    monkeypatch.chdir(tmp_path)          # screenshots / logcat after a tap land here
     path = tmp_path / "latency.json"
     monkeypatch.setattr(a, "DEFAULT_CACHE_FILE", str(path))
     return path
@@ -109,6 +110,8 @@ class FakeDevice(a.Device):
                     self.taps.append(cmd)
                 else:
                     self.probe_taps.append(cmd)
+        elif cmd.startswith("pidof"):
+            out = "21464"
         elif cmd.startswith("ping"):
             out, rc = self.ping_output, (0 if self.ping_output else 2)
         elif cmd.startswith("date"):
@@ -139,6 +142,10 @@ class FakeDevice(a.Device):
         elif cmd.startswith("cat"):
             out = self.xml
         return a.ShellResult(cmd, rc, out)
+
+    def read_bytes(self, cmd, timeout=15.0):
+        self.commands.append(cmd)
+        return b"\x89PNG\r\n\x1a\nfake"
 
     def _timed_tap(self, cmd, timeout):
         """tap_command(): prints the start time, logs the injection like HyperOS."""
@@ -513,10 +520,42 @@ def test_taps_where_the_button_is_at_fire_time(monkeypatch, caplog):
     assert "button moved from (540, 2070) to (540, 1870)" in caplog.text
 
 
-def test_unchanged_screen_after_tap_warns(monkeypatch, caplog):
+def test_unchanged_screen_after_tap_points_to_screenshots(monkeypatch, caplog, tmp_path):
+    caplog.set_level("INFO")
     dev = FakeDevice()
-    assert run_with(monkeypatch, dev, ["--test-in", "5", "--clicks", "1"]) == a.EXIT_OK
-    assert "Screen unchanged after tapping" in caplog.text
+    log_file = tmp_path / "logs" / "unlock.log"
+    log_file.parent.mkdir()
+    argv = ["--test-in", "5", "--clicks", "1", "--log-file", str(log_file)]
+    assert run_with(monkeypatch, dev, argv) == a.EXIT_OK
+    shots = sorted(log_file.parent.glob("miunlock_*_tap+*.png"))
+    assert [p.name.split("_tap")[1] for p in shots] == ["+0.5s.png", "+1.5s.png", "+3s.png"]
+    assert all(p.read_bytes().startswith(b"\x89PNG") for p in shots)
+    assert len(list(log_file.parent.glob("miunlock_*_app_logcat.txt"))) == 1
+    assert any(c.startswith("logcat -d -v epoch --pid=21464") for c in dev.commands)
+    record, = [r for r in caplog.records if "did not change" in r.getMessage()]
+    assert record.levelname == "INFO" and str(shots[0]) in record.getMessage()
+
+
+def test_screenshots_are_taken_while_a_toast_is_visible(monkeypatch):
+    dev = FakeDevice()
+    shot_times = []
+    real_read = dev.read_bytes
+
+    def read_bytes(cmd, timeout=15.0):
+        shot_times.append(a.time.time())
+        return real_read(cmd, timeout)
+    dev.read_bytes = read_bytes
+    taps = []
+    real_run = dev.run
+
+    def run(cmd, timeout=30.0):
+        if cmd.startswith("echo \"miunlock_start="):
+            taps.append(a.time.time())
+        return real_run(cmd, timeout)
+    dev.run = run
+    assert run_with(monkeypatch, dev, ["--test-in", "5"]) == a.EXIT_OK
+    after = [t - taps[-1] for t in shot_times]
+    assert len(after) == 3 and after[0] < 1.0 and after[-1] < 3.5
 
 
 def test_new_screen_text_after_tap_is_logged(caplog):
@@ -524,7 +563,8 @@ def test_new_screen_text_after_tap_is_logged(caplog):
     dev = FakeDevice(xml=UI_XML.replace("Apply for unlocking", "Applied, come back tomorrow")
                      .replace('text="20:07"', 'text="00:00"'))
     button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
-    assert a.verify_after_tap(dev, button, "Apply for unlocking", UI_XML, "10-05 20:07:03.000")
+    assert a.verify_after_tap(dev, button, "Apply for unlocking", UI_XML,
+                              "10-05 20:07:03.000") == (True, True)
     assert "New on screen: Applied, come back tomorrow" in caplog.text   # no systemui clock
     assert "Screen changed after tapping" in caplog.text
 
@@ -568,8 +608,8 @@ def test_logcat_denial_after_tap_fails():
     dev = FakeDevice()
     dev.logcat = LOGCAT_DENIAL
     button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
-    assert not a.verify_after_tap(dev, button, "Apply for unlocking", UI_XML,
-                                  "10-05 20:07:03.000")
+    assert a.verify_after_tap(dev, button, "Apply for unlocking", UI_XML,
+                              "10-05 20:07:03.000") == (False, None)
 
 
 # --------------------------------------------------------------------------- timing

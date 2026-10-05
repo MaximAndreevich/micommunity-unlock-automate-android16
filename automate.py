@@ -98,6 +98,10 @@ FINAL_CHECK_SEC = 20.0           # last check (state + UI dump, no input) at T-2
 FINAL_CHECK_BUDGET_SEC = 8.0     # ... takes at most this long in total
 FINAL_DUMP_TIMEOUT_SEC = 6.0     # ... with a single uiautomator dump attempt
 LATE_SEND_WARN_MS = 50           # a tap sent later than planned by more than this warns
+# The server reply is usually a toast: drawn by SystemUI, not in the app's UI dump, and
+# gone after ~2 s. So the screen is captured at these moments after the tap.
+SCREENSHOT_AFTER_SEC = (0.5, 1.5, 3.0)
+VERIFY_AFTER_SEC = 5.0           # the UI dump of the app after the tap
 PROBE_SAFETY_SEC = 2.0           # the last probe must start this long before T-60 s
 
 MIN_CLICK_DELAY_SEC = 60.0       # the server accepts one unlock request per minute
@@ -232,6 +236,13 @@ class Device:
         if res.security_denied:
             raise PermissionDenied(f"'{cmd}': {res.first_line_of_error()}")
         raise DeviceError(f"'{cmd}': {res.first_line_of_error()}")
+
+    def read_bytes(self, cmd: str, timeout: float = 15.0) -> bytes:
+        """Binary output of a shell command (e.g. screencap -p)."""
+        try:
+            return self._dev.shell(cmd, timeout=timeout, encoding=None, rstrip=False)
+        except (AdbError, OSError) as exc:
+            raise DeviceError(f"adb shell '{cmd}' failed: {exc}") from exc
 
     def getprop(self, name: str) -> str:
         """Returns a system property ('' if unavailable)."""
@@ -1422,16 +1433,17 @@ def screen_texts(xml: str) -> list[str]:
 
 
 def verify_after_tap(dev: Device, button: Button, button_text: str,
-                     xml_before: str, since: str) -> bool:
+                     xml_before: str, since: str) -> tuple[bool, bool | None]:
     """
-    Checks that the taps had an effect. False if the device rejected them (logcat).
-    An unchanged screen is only a warning: the request may still be on its way.
+    Checks that the taps had an effect. Returns (ok, screen changed or None if unknown);
+    ok is False if the device rejected them (logcat). An unchanged app screen is no
+    error: the reply may have been a toast.
     """
     denial = logcat_denial(dev, since)
     if denial:
         log.error("The device rejected the taps: %s", denial)
         log.error(INJECT_HINT)
-        return False
+        return False, None
     try:
         xml_after = dump_ui(dev, attempts=1)
         after = screen_texts(xml_after)
@@ -1439,18 +1451,79 @@ def verify_after_tap(dev: Device, button: Button, button_text: str,
         fresh = find_button(xml_after, button_text, BUTTON_RESOURCE_ID)
     except (DeviceError, ET.ParseError) as exc:
         log.warning("Could not check the screen after tapping: %s", exc)
-        return True
+        return True, None
     new = [t for t in after if t not in before]
     if new:
         log.info("New on screen: %s", " | ".join(new[:15]))
     if not xml_before:
-        return True
-    if new or fresh is None or fresh.enabled != button.enabled:
+        return True, None
+    changed = bool(new) or fresh is None or fresh.enabled != button.enabled
+    if changed:
         log.info("Screen changed after tapping.")
-    else:
-        log.warning("Screen unchanged after tapping - the taps may have been dropped. "
-                    "Check the phone.")
-    return True
+    return True, changed
+
+
+def evidence_dir(args) -> Path:
+    """Screenshots and logcat go next to the log file (or to the current directory)."""
+    return Path(args.log_file).resolve().parent if args.log_file else Path.cwd()
+
+
+def capture_screenshots(dev: Device, clock: Clock, tap_utc: datetime, out_dir: Path,
+                        prefix: str) -> list[str]:
+    """screencap at SCREENSHOT_AFTER_SEC after the tap, saved as PNG; returns the paths."""
+    paths = []
+    for offset in SCREENSHOT_AFTER_SEC:
+        wait = (tap_utc + timedelta(seconds=offset) - clock.now()).total_seconds()
+        if wait > 0:
+            time.sleep(wait)
+        path = out_dir / f"{prefix}_tap+{offset:g}s.png"
+        try:
+            png = dev.read_bytes("screencap -p")
+            if not png.startswith(b"\x89PNG"):
+                raise DeviceError(f"screencap returned no PNG ({png[:40]!r})")
+            path.write_bytes(png)
+        except (DeviceError, OSError) as exc:
+            log.warning("Screenshot %g s after the tap failed: %s", offset, exc)
+            continue
+        paths.append(str(path))
+    if paths:
+        log.info("Screenshots after the tap: %s", ", ".join(paths))
+    return paths
+
+
+def save_app_logcat(dev: Device, since: str, out_dir: Path, prefix: str) -> None:
+    """Saves the Mi Community logcat since `since` (the tap window) to a file."""
+    try:
+        pid = dev.run(f"pidof {APP_PACKAGE}", timeout=5).output.split()
+        if not pid or not since:
+            log.warning("App logcat not saved: %s", "no pid" if not pid else "no start time")
+            return
+        out = dev.run(f"logcat -d -v epoch --pid={pid[0]} -T '{since}'", timeout=20).output
+        path = out_dir / f"{prefix}_app_logcat.txt"
+        path.write_text(out, encoding="utf-8")
+    except (DeviceError, OSError) as exc:
+        log.warning("App logcat not saved: %s", exc)
+        return
+    log.info("App logcat of the tap window saved to %s.", path)
+
+
+def after_tap(ses: Session, button: Button, xml_before: str, since: str,
+              last_tap_utc: datetime) -> bool:
+    """Screenshots, the denial / screen check and the app logcat after the last tap."""
+    out_dir = evidence_dir(ses.args)
+    prefix = "miunlock_" + last_tap_utc.astimezone().strftime("%Y%m%d-%H%M%S")
+    shots = capture_screenshots(ses.dev, ses.clock, last_tap_utc, out_dir, prefix)
+    wait = (last_tap_utc + timedelta(seconds=VERIFY_AFTER_SEC)
+            - ses.clock.now()).total_seconds()
+    if wait > 0:
+        log.info("Keeping the screen on for %.0f s while the request loads...", wait)
+        time.sleep(wait)
+    ok, changed = verify_after_tap(ses.dev, button, ses.args.button_text, xml_before, since)
+    if changed is False:
+        log.info("The app screen did not change; the reply may have been a toast - see "
+                 + "the screenshots: %s", ", ".join(shots) or "none were saved")
+    save_app_logcat(ses.dev, since, out_dir, prefix)
+    return ok
 
 
 def warn_if_late(i: int, count: int, due: datetime, now: datetime) -> None:
@@ -1729,11 +1802,9 @@ def fire(ses: Session, button: Button) -> int:
         since = device_time(dev)    # logcat window for the post-tap denial check
     wait_until(send_utc, clock, dev, quiet=True)
     done = click(dev, button, clock, args, planned=send_utc)
-    if not args.dry_run and done:
-        log.info("Keeping the screen on for 5 s while the request loads...")
-        time.sleep(5)
-        if not verify_after_tap(dev, button, args.button_text, xml_before, since):
-            done = 0
+    last_tap = send_utc + timedelta(seconds=args.delay * (args.clicks - 1))
+    if not args.dry_run and done and not after_tap(ses, button, xml_before, since, last_tap):
+        done = 0
     if done == args.clicks:
         log.info("[SUCCESS] %d/%d taps %s.", done, args.clicks,
                  "simulated" if args.dry_run else "injected")
