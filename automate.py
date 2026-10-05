@@ -103,6 +103,8 @@ PROBE_MIN_SEC = 5.0              # no probes if less than this is left before T-
 FINAL_CHECK_SEC = 20.0           # last check (state + UI dump, no input) at T-20 s
 FINAL_CHECK_BUDGET_SEC = 8.0     # ... takes at most this long in total
 FINAL_DUMP_TIMEOUT_SEC = 6.0     # ... with a single uiautomator dump attempt
+FOCUS_CHECK_SEC = 3.0            # last look (screen + focus, no input) before the first tap ...
+FOCUS_CHECK_BUDGET_SEC = 1.5     # ... taking at most this long
 LATE_SEND_WARN_MS = 50           # a tap sent later than planned by more than this warns
 # The server reply is usually a toast: drawn by SystemUI, not in the app's UI dump, and
 # gone after ~2 s. So the screen is captured at these moments after the tap.
@@ -1318,6 +1320,35 @@ def final_check(dev: Device, button_text: str, button: Button,
     return fresh, xml
 
 
+def window_ready(dev: Device) -> bool:
+    """
+    Last look before the first tap (FOCUS_CHECK_SEC before it): the screen is on and
+    Mi Community has the focus. A dialog that opened after the final check, or the lock
+    screen, would get the tap at the button's coordinates - then no tap is sent (False).
+    Injects nothing and takes at most FOCUS_CHECK_BUDGET_SEC; if the state cannot be
+    read in time, the tap goes ahead.
+    """
+    try:
+        with dev.time_budget(FOCUS_CHECK_BUDGET_SEC):
+            awake = screen_awake(dev)
+            pkg = foreground_package(dev)
+    except DeviceError as exc:
+        log.warning("Focus check failed (%s) - tapping anyway.", exc)
+        return True
+    if awake is False:
+        log.error("Focus check: the screen is off - no tap.")
+        return False
+    if pkg and pkg != APP_PACKAGE:
+        log.error("Focus check: '%s' has the focus, not Mi Community (a dialog?) - no tap, "
+                  + "it would land in that window.", pkg)
+        return False
+    if pkg:
+        log.info("Focus check passed: Mi Community has the focus.")
+    else:
+        log.warning("Focus check: the focused app is unknown - tapping anyway.")
+    return True
+
+
 @dataclass
 class Session:
     """What the steps after the audit share."""
@@ -1326,6 +1357,16 @@ class Session:
     args: argparse.Namespace
     target_utc: datetime            # quota reset (00:00:00 CST or the test target)
     measure: bool                   # measure the latency in the probe window
+
+
+def ready_before(ses: Session, send_utc: datetime) -> bool:
+    """window_ready() FOCUS_CHECK_SEC before the first tap; True if that moment has
+    passed already (then the final check has just looked)."""
+    focus_at = send_utc - timedelta(seconds=FOCUS_CHECK_SEC)
+    if focus_at <= ses.clock.now():
+        return True
+    wait_until(focus_at, ses.clock, ses.dev, quiet=True)
+    return window_ready(ses.dev)
 
 
 def probe_phase(ses: Session, button: Button) -> Measurement | None:
@@ -1895,8 +1936,10 @@ def fire(ses: Session, button: Button) -> int:
         since = device_time(dev)    # logcat window for the post-tap denial check
     fired = FiredTaps(plan, since, send_utc,
                       send_utc + timedelta(seconds=args.delay * (args.clicks - 1)))
-    wait_until(send_utc, clock, dev, quiet=True)
-    done = click(dev, button, clock, args, fired)
+    done = 0
+    if ready_before(ses, send_utc):
+        wait_until(send_utc, clock, dev, quiet=True)
+        done = click(dev, button, clock, args, fired)
     if not args.dry_run and done and not after_tap(ses, button, xml_before, fired):
         done = 0
     if done == args.clicks:

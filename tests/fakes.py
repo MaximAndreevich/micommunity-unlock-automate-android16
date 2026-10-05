@@ -61,6 +61,7 @@ class FakeDevice(a.Device):
         self.logcat = ""
         self.probe_taps = []                 # taps outside the unlock button
         self.other_window_taps = []          # taps while another window had the focus
+        self.awake = True                    # screen on
         self.store = {"global/stay_on_while_plugged_in": "0",
                       "system/screen_off_timeout": "30000"}
         self.taps = []
@@ -150,7 +151,7 @@ class FakeDevice(a.Device):
                 else:
                     self.store.pop(f"{parts[2]}/{parts[3]}", None)
         elif cmd.startswith("dumpsys power"):
-            out = "  mWakefulness=Awake"
+            out = f"  mWakefulness={'Awake' if self.awake else 'Asleep'}"
         elif cmd.startswith("dumpsys window"):
             out = (f"  mCurrentFocus=Window{{4f2 u0 {self.focus}/com.mi.Unlock}}"
                    if self.focus != "NotificationShade"
