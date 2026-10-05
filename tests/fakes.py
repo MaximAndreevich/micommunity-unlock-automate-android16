@@ -70,11 +70,30 @@ class FakeDevice(a.Device):
         self.injections = []                 # (command, moment the event was injected)
         self.tap_rt_ms = tap_rt_ms           # round-trip of a tap command
         self.inject_log = inject_log         # HyperOS logs every injection (MIUIInput)
+        self.broken = ()                     # command prefixes failing with an adb error
+        self.timeline = []                   # (virtual time, state changes), see at()
 
     hang = ()                                # command prefixes that never answer
 
+    def at(self, moment, **changes):
+        """From `moment` (virtual time.time()) on, the phone behaves as `changes` say:
+        e.g. inject=False (toggle reset), silent_denial=True, broken=("",) (cable out)."""
+        self.timeline.append((moment, changes))
+        self.timeline.sort(key=lambda event: event[0])
+
+    def _advance(self):
+        if not self.timeline:
+            return                           # no extra clock calls in plain tests
+        now = a.time.time()
+        while self.timeline and self.timeline[0][0] <= now:
+            for name, value in self.timeline.pop(0)[1].items():
+                setattr(self, name, value)
+
     def _shell(self, cmd, timeout):
+        self._advance()
         self.commands.append(cmd)
+        if cmd.startswith(self.broken):
+            raise a.DeviceError(f"adb shell '{cmd}' failed: device offline")
         if cmd.startswith(self.hang):
             a.time.sleep(timeout)
             raise a.DeviceError(f"adb shell '{cmd}' failed: timeout")
@@ -137,7 +156,10 @@ class FakeDevice(a.Device):
         return a.ShellResult(cmd, rc, out)
 
     def read_bytes(self, cmd, timeout=15.0):
+        self._advance()
         self.commands.append(cmd)
+        if cmd.startswith(self.broken):
+            raise a.DeviceError(f"adb shell '{cmd}' failed: device offline")
         return b"\x89PNG\r\n\x1a\nfake"
 
     def _timed_tap(self, cmd, timeout):
