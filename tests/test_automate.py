@@ -60,6 +60,7 @@ class FakeDevice(a.Device):
                       "system/screen_off_timeout": "30000"}
         self.taps = []
         self.commands = []
+        self.ping_output = ""                # "" = ping not available
 
     def run(self, cmd, timeout=30.0):
         self.commands.append(cmd)
@@ -84,6 +85,8 @@ class FakeDevice(a.Device):
                     self.taps.append(cmd)
                 else:
                     self.probe_taps.append(cmd)
+        elif cmd.startswith("ping"):
+            out, rc = self.ping_output, (0 if self.ping_output else 2)
         elif cmd.startswith("date"):
             out = "10-05 20:07:03.000"
         elif cmd.startswith("logcat"):
@@ -393,12 +396,15 @@ def test_final_check_stops_when_toggle_reset(monkeypatch):
         a.final_check(dev, "Apply for unlocking", button, need_inject=True)
 
 
-def test_probe_phase_stops_on_silent_denial(monkeypatch):
+@pytest.mark.parametrize("measure", [False, True])
+def test_probe_phase_stops_on_silent_denial(monkeypatch, measure):
     monkeypatch.setattr(a.time, "sleep", lambda s: None)
     dev = FakeDevice(silent_denial=True, adbinput="")
-    button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+    clock = FakeClock()
+    ses = a.Session(dev, clock, a.build_parser().parse_args([]),
+                    clock.t + timedelta(seconds=120), measure)
     with pytest.raises(a.DeviceError, match="Permission denied: injecting"):
-        a.probe_phase(dev, "Apply for unlocking", button, need_inject=True)
+        a.probe_phase(ses, a.find_button(UI_XML, "Apply for unlocking", "x"))
 
 
 def test_final_check_injects_nothing(monkeypatch):
@@ -445,3 +451,134 @@ def test_logcat_denial_after_tap_fails():
     button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
     assert not a.verify_after_tap(dev, button, "Apply for unlocking", UI_XML,
                                   "10-05 20:07:03.000")
+
+
+# --------------------------------------------------------------------------- timing
+
+T0 = datetime(2026, 10, 6, 16, 0, tzinfo=timezone.utc)      # 00:00:00 CST
+
+
+def plan_for(argv, samples=None, net=None):
+    args = a.build_parser().parse_args(argv)
+    tap = a.LatencyStats(samples) if samples else None
+    plan = a.plan_timing(args, tap, a.LatencyStats(net) if net else None, "test")
+    return a.checked_send_time(plan, T0)
+
+
+def ms(n):
+    return timedelta(milliseconds=n)
+
+
+def test_fixed_timing_sends_at_150_ms():
+    plan, send = plan_for(["--timing", "fixed"], samples=[120, 125, 140])
+    assert (plan.mode, plan.compensation_ms) == ("fixed", 0)
+    assert send == T0 + ms(150)
+    assert send.astimezone(timezone(a.BEIJING_OFFSET)).strftime("%H:%M:%S.%f") \
+        == "00:00:00.150000"
+
+
+def test_adaptive_compensates_minimal_tap_latency():
+    plan, send = plan_for([], samples=[120, 125, 140])
+    assert (plan.mode, plan.margin_ms, plan.compensation_ms) == ("adaptive", 50, 120)
+    assert send == T0 + ms(50) - ms(120)
+    assert plan.earliest_arrival(T0) == T0 + ms(50)
+
+
+def test_adaptive_compensates_half_of_network_rtt():
+    plan, send = plan_for(["--api-host", "example.org"], samples=[120, 125, 140],
+                          net=[80, 90, 300])
+    assert plan.compensation_ms == 160
+    assert send == T0 + ms(50) - ms(160)
+
+
+def test_compensation_rounds_down():
+    plan, send = plan_for([], samples=[120.9, 125, 140])
+    assert plan.compensation_ms == 120
+    assert send == T0 - ms(70)
+
+
+def test_wide_spread_raises_margin(caplog):
+    plan, send = plan_for([], samples=[100, 110, 120, 400])
+    assert plan.margin_ms == 150
+    assert send == T0 + ms(150) - ms(100)
+    assert "Tap latency varies a lot" in caplog.text
+
+
+def test_no_estimate_falls_back_to_standard_margin(caplog):
+    plan, send = plan_for([])
+    assert (plan.mode, send) == ("fixed", T0 + ms(150))
+    assert "Latency estimate impossible - using the standard margin of 150 ms" \
+        in caplog.text
+
+
+def test_guard_rejects_early_arrival(caplog):
+    plan, send = plan_for(["--adaptive-margin-ms", "10"], samples=[120, 125, 140])
+    assert (plan.mode, send) == ("fixed", T0 + ms(150))
+    assert any(r.levelname == "ERROR" and "Timing guard" in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize("argv", [["--margin-ms", "-1"], ["--adaptive-margin-ms", "-5"],
+                                  ["--probes", "1"], ["--api-host", "x; reboot"]])
+def test_bad_timing_args_rejected(argv):
+    p = a.build_parser()
+    with pytest.raises(SystemExit):
+        a.validate_args(p, p.parse_args(argv))
+
+
+def test_lead_ms_is_ignored_with_warning(monkeypatch, caplog):
+    dev = FakeDevice()
+    assert run_with(monkeypatch, dev, DRY + ["--lead-ms", "200"]) == a.EXIT_OK
+    assert "--lead-ms is deprecated and ignored" in caplog.text
+
+
+def test_adaptive_run_measures_in_the_probe_window(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    dev = FakeDevice()
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
+    assert len(dev.probe_taps) == 1 + 20         # audit + latency probes
+    assert dev.taps == []                        # dry run: no real tap
+    assert "Tap latency measured" in caplog.text
+    assert "Timing: adaptive (measured)" in caplog.text
+    assert "request reaches the server no earlier than" in caplog.text
+
+
+def test_adaptive_run_pings_api_host(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    dev = FakeDevice()
+    dev.ping_output = "\n".join(f"64 bytes from 1.2.3.4: icmp_seq={i} ttl=50 time={t} ms"
+                                for i, t in enumerate([41.5, 40.2, 55.0]))
+    argv = ["--dry-run", "--test-in", "150", "--api-host", "example.org"]
+    assert run_with(monkeypatch, dev, argv) == a.EXIT_OK
+    assert "Network RTT to example.org measured: min 40" in caplog.text
+    assert "compensation 20 ms" in caplog.text   # tap latency ~0 ms in the fake
+
+
+def test_unavailable_ping_is_not_compensated(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    argv = ["--dry-run", "--test-in", "150", "--api-host", "example.org"]
+    assert run_with(monkeypatch, FakeDevice(), argv) == a.EXIT_OK
+    assert "ping example.org from the phone is not available" in caplog.text
+    assert "compensation 0 ms, margin 50 ms" in caplog.text
+
+
+def test_late_start_does_not_measure(monkeypatch, caplog):
+    dev = FakeDevice()
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "100"]) == a.EXIT_OK
+    assert len(dev.probe_taps) == 2              # audit + one injection probe, no timing
+    assert "no latency measurement" in caplog.text
+    assert "using the standard margin of 150 ms" in caplog.text
+
+
+def test_failed_probes_are_inconclusive(monkeypatch, caplog):
+    dev = FakeDevice()
+    real_run = dev.run
+
+    def run(cmd, timeout=30.0):
+        if cmd == "input tap 370 160" and len(dev.probe_taps) > 1:
+            return a.ShellResult(cmd, 1, "Error: injection timed out")
+        return real_run(cmd, timeout)
+    dev.run = run
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
+    assert "Latency measurement inconclusive" in caplog.text
+    assert "using the standard margin of 150 ms" in caplog.text
