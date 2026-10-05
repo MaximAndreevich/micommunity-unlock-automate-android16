@@ -1,8 +1,9 @@
 """Timing invariants: whatever was measured and whatever the options, the tap never
 reaches the device (and so the server) before target + MIN_ARRIVAL_MS.
 
-The checks below recompute the bounds from the measurement itself instead of trusting
-TimingPlan, so a wrong compensation_ms / send_time cannot hide behind its own numbers.
+The checks (fakes.assert_timing_invariants) recompute the bounds from the measurement
+itself instead of trusting TimingPlan, so a wrong compensation_ms / send_time cannot hide
+behind its own numbers.
 """
 
 import itertools
@@ -10,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from fakes import T0, FakeDevice, a, measurement, ms, run_with
+from fakes import T0, FakeDevice, a, assert_timing_invariants, measurement, ms, planned, run_with
 
 INJECT = [[1.0], [53.04, 66.58, 79.56], [69.999, 70.5], [120.9, 125, 140],
           [100, 110, 120, 400], [900.5, 910]]
@@ -23,52 +24,6 @@ ARGS = [[], ["--adaptive-margin-ms", "0"], ["--adaptive-margin-ms", "49"],
         ["--adaptive-margin-ms", "300"], ["--timing", "fixed"],
         ["--timing", "fixed", "--margin-ms", "0"], ["--margin-ms", "20"],
         ["--margin-ms", "400"]]
-
-
-def proven_delay_ms(plan, measured):
-    """Send -> arrival delay the measurement proves (0 unless the plan compensates)."""
-    if plan.mode != "adaptive":
-        return 0.0
-    return measured.inject.min + (measured.net.min / 2 if measured.net else 0.0)
-
-
-def assert_timing_invariants(plan, send, target, measured, args):
-    proven = proven_delay_ms(plan, measured)
-    # no false start: even the fastest measured delivery arrives after target + 50 ms
-    assert send + timedelta(milliseconds=proven) >= target + ms(a.MIN_ARRIVAL_MS)
-    # the compensation is whole ms, never more than proven, wasting less than 1 ms
-    assert isinstance(plan.compensation_ms, int)
-    assert 0 <= plan.compensation_ms <= proven
-    if plan.mode == "adaptive":
-        assert proven - plan.compensation_ms < 1
-        # the device part of a tap fits into its round-trip minus the way there and back
-        adb = measured.adb_rtt.min / 2 if measured.adb_rtt else 0.0
-        assert measured.inject.min <= measured.round_trip.min - adb
-    else:
-        assert plan.compensation_ms == 0
-    # send time and the bound it promises agree with the plan
-    assert send == plan.send_time(target) == target + ms(plan.margin_ms - plan.compensation_ms)
-    assert plan.earliest_arrival(target) == target + ms(plan.margin_ms)
-    assert send >= target - ms(plan.compensation_ms)
-    assert plan.margin_ms >= a.MIN_ARRIVAL_MS
-    assert_margin_rule(plan, measured, args)
-
-
-def assert_margin_rule(plan, measured, args):
-    if plan.source == "guard fallback":
-        assert (plan.mode, plan.margin_ms) == ("fixed", a.DEFAULT_MARGIN_MS)
-    elif plan.mode == "fixed":
-        assert plan.margin_ms == args.margin_ms
-    else:
-        wide = measured.inject.p95 - measured.inject.min > a.WIDE_SPREAD_MS
-        expected = max(args.adaptive_margin_ms, a.WIDE_SPREAD_MARGIN_MS if wide else 0)
-        assert plan.margin_ms == expected
-
-
-def planned(argv, measured, target=T0):
-    args = a.build_parser().parse_args(argv)
-    plan, send = a.checked_send_time(a.plan_timing(args, measured, "test"), target)
-    return args, plan, send
 
 
 @pytest.mark.parametrize("argv", ARGS, ids=" ".join)
