@@ -111,7 +111,8 @@ def test_find_button_substring_in_content_desc():
 
 def test_find_button_skips_zero_size_node():
     hidden = '<node text="Apply for unlocking" bounds="[0,0][0,0]" enabled="true"/>'
-    xml = UI_XML.replace('<node text="Unlock bootloader"', hidden + '\n<node text="Unlock bootloader"')
+    anchor = '<node text="Unlock bootloader"'
+    xml = UI_XML.replace(anchor, hidden + "\n" + anchor)
     b = a.find_button(xml, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
     assert (b.x, b.y, b.matched_by) == (540, 2070, "text")
 
@@ -224,3 +225,13 @@ def test_ntp_resync_before_target(monkeypatch, wait_sec, expected_syncs):
     a.wait_until(target, clock, FakeDevice(), need_inject=True)
     assert clock.syncs == expected_syncs
     assert clock.t >= target
+
+
+def test_click_stops_after_security_denial(monkeypatch, caplog):
+    monkeypatch.setattr(a.time, "sleep", lambda s: None)
+    dev = FakeDevice(inject=False)
+    button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+    args = a.build_parser().parse_args(["--clicks", "3"])
+    assert a.click(dev, button, FakeClock(), args) == 0
+    assert sum(c.startswith("input tap") for c in dev.commands) == 1
+    assert "USB debugging (Security settings)" in caplog.text

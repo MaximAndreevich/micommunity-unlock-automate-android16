@@ -719,14 +719,14 @@ def wait_until(target_utc: datetime, clock: Clock, dev: Device, need_inject: boo
             pass  # busy-wait the last 50 ms for precision
 
 
-def click(dev: Device, button: Button, count: int, delay: float, dry_run: bool,
-          clock: Clock) -> int:
-    """Returns the number of taps that were injected successfully."""
+def click(dev: Device, button: Button, clock: Clock, args) -> int:
+    """Taps args.clicks times. Returns the number of taps injected successfully."""
+    cmd = f"input tap {button.x} {button.y}"
+    count = args.clicks
     done = 0
     for i in range(1, count + 1):
         stamp = clock.now().astimezone(timezone(BEIJING_OFFSET)).strftime("%H:%M:%S.%f")[:-3]
-        cmd = f"input tap {button.x} {button.y}"
-        if dry_run:
+        if args.dry_run:
             log.info("[DRY-RUN] tap %d/%d at %s CST: would run '%s'", i, count, stamp, cmd)
             done += 1
         else:
@@ -734,17 +734,17 @@ def click(dev: Device, button: Button, count: int, delay: float, dry_run: bool,
                 res = dev.run(cmd, timeout=10)
             except DeviceError as exc:
                 log.error("Tap %d/%d failed: %s", i, count, exc)
-                res = None
-            if res is not None and res.ok:
-                done += 1
-                log.info("Tap %d/%d injected at %s CST.", i, count, stamp)
-            elif res is not None:
-                log.error("Tap %d/%d rejected: %s", i, count, res.first_line_of_error())
-                if res.security_denied:
-                    log.error(INJECT_HINT)
-                    break   # further taps will fail the same way
+            else:
+                if res.ok:
+                    done += 1
+                    log.info("Tap %d/%d injected at %s CST.", i, count, stamp)
+                else:
+                    log.error("Tap %d/%d rejected: %s", i, count, res.first_line_of_error())
+                    if res.security_denied:
+                        log.error(INJECT_HINT)
+                        break   # further taps will fail the same way
         if i < count:
-            time.sleep(delay)
+            time.sleep(args.delay)
     return done
 
 
@@ -879,7 +879,7 @@ def run(args) -> int:
 
     with ScreenKeeper(dev, report.can_write_settings):
         wait_until(target_utc, clock, dev, need_inject=not args.dry_run)
-        done = click(dev, report.button, args.clicks, args.delay, args.dry_run, clock)
+        done = click(dev, report.button, clock, args)
         if done == args.clicks:
             log.info("[SUCCESS] %d/%d taps %s.", done, args.clicks,
                      "simulated" if args.dry_run else "injected")
