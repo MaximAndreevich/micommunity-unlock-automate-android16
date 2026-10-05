@@ -104,19 +104,23 @@ class PermissionDenied(DeviceError):
 
 @dataclass
 class ShellResult:
+    """Result of an adb shell command (exit code + combined output)."""
     cmd: str
     returncode: int
     output: str
 
     @property
     def ok(self) -> bool:
+        """True if the command exited 0 and printed no exception."""
         return self.returncode == 0 and not _EXCEPTION_RE.search(self.output)
 
     @property
     def security_denied(self) -> bool:
+        """True if the output mentions a missing permission."""
         return bool(_SECURITY_RE.search(self.output))
 
     def first_line_of_error(self) -> str:
+        """Most relevant error line for logging."""
         lines = self.output.splitlines()
         # prefer the actual exception ("java.lang.SecurityException: ...") over the header
         for line in lines:
@@ -138,6 +142,7 @@ class Device:
         self.serial = adb_device.serial
 
     def run(self, cmd: str, timeout: float = 30.0) -> ShellResult:
+        """Runs a shell command; raises DeviceError only on transport failures."""
         try:
             ret = self._dev.shell2(cmd, timeout=timeout, rstrip=True)
         except (AdbError, OSError) as exc:
@@ -154,12 +159,14 @@ class Device:
         raise DeviceError(f"'{cmd}': {res.first_line_of_error()}")
 
     def getprop(self, name: str) -> str:
+        """Returns a system property ('' if unavailable)."""
         try:
             return self.check(f"getprop {name}", timeout=10)
         except DeviceError:
             return ""
 
     def is_alive(self) -> bool:
+        """True if the shell responds."""
         try:
             return self.run("echo ok", timeout=5).output.strip() == "ok"
         except DeviceError:
@@ -222,6 +229,7 @@ class Clock:
             self.sync()
 
     def sync(self) -> None:
+        """Measures the local clock offset against NTP (best of several samples)."""
         client = ntplib.NTPClient()
         samples: list[tuple[float, float]] = []   # (delay, offset)
         errors: list[str] = []
@@ -248,6 +256,7 @@ class Clock:
                  self.server, offset, delay * 1000, len(samples), NTP_SAMPLES)
 
     def now(self) -> datetime:
+        """Current NTP-corrected time in UTC."""
         return datetime.fromtimestamp(time.time() + self.offset, tz=timezone.utc)
 
 
@@ -265,6 +274,7 @@ def next_occurrence(time_str: str, now_utc: datetime, tz_offset: timedelta) -> d
 
 
 def parse_time(value: str):
+    """Parses HH:MM[:SS[.fff]], returns None if invalid."""
     for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
         try:
             return datetime.strptime(value, fmt).time()
@@ -277,6 +287,7 @@ def parse_time(value: str):
 
 @dataclass
 class Button:
+    """Located unlock button: tap point, bounds and how it was matched."""
     x: int
     y: int
     bounds: str
@@ -350,6 +361,7 @@ def foreground_package(dev: Device) -> str:
 
 
 def screen_awake(dev: Device) -> bool | None:
+    """True/False from dumpsys power, None if unknown."""
     out = dev.run("dumpsys power | grep -m1 mWakefulness=", timeout=15).output
     if "mWakefulness=" not in out:
         return None
@@ -359,6 +371,7 @@ def screen_awake(dev: Device) -> bool | None:
 # --------------------------------------------------------------------------- audit
 
 class Status(Enum):
+    """Audit check result level."""
     OK = "OK"
     INFO = "INFO"
     WARN = "WARN"
@@ -367,6 +380,7 @@ class Status(Enum):
 
 @dataclass
 class Check:
+    """Single audit check line."""
     name: str
     status: Status
     detail: str = ""
@@ -375,21 +389,25 @@ class Check:
 
 @dataclass
 class AuditReport:
+    """Collected audit checks plus facts the run needs (button, permissions)."""
     checks: list[Check] = field(default_factory=list)
     button: Button | None = None
     can_write_settings: bool = False
     can_inject: bool = False
 
     def add(self, name: str, status: Status, detail: str = "", hint: str = "") -> Check:
+        """Appends a check and returns it."""
         check = Check(name, status, detail, hint)
         self.checks.append(check)
         return check
 
     @property
     def failed(self) -> bool:
+        """True if any check is FAIL."""
         return any(c.status is Status.FAIL for c in self.checks)
 
     def print(self) -> None:
+        """Logs the report as a table with hints for WARN/FAIL items."""
         log.info("-" * 64)
         log.info("Preflight audit")
         log.info("-" * 64)
@@ -434,6 +452,7 @@ def probe_settings_write(dev: Device) -> tuple[bool, str]:
 
 
 def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
+    """Runs all preflight checks without changing anything on the device."""
     rep = AuditReport()
 
     # --- device info
@@ -688,6 +707,7 @@ def click(dev: Device, button: Button, count: int, delay: float, dry_run: bool,
 # --------------------------------------------------------------------------- CLI
 
 def build_parser() -> argparse.ArgumentParser:
+    """Command line interface."""
     p = argparse.ArgumentParser(
         description="Automate the Mi Community unlock request at 00:00 Beijing time via ADB.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -727,6 +747,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(p: argparse.ArgumentParser, args) -> None:
+    """Validates argument combinations; exits via p.error() on bad input."""
     if args.clicks < 1:
         p.error("--clicks must be >= 1")
     if args.delay < 0:
@@ -747,6 +768,7 @@ def validate_args(p: argparse.ArgumentParser, args) -> None:
 
 
 def setup_logging(verbose: bool, log_file: str | None) -> None:
+    """Console logging (INFO or DEBUG) plus an optional DEBUG log file."""
     fmt = logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)-7s %(message)s", "%H:%M:%S")
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
@@ -763,6 +785,7 @@ def setup_logging(verbose: bool, log_file: str | None) -> None:
 
 
 def compute_target(args, clock: Clock) -> tuple[datetime, str]:
+    """Target moment in UTC and a human-readable description of it."""
     now = clock.now()
     if args.test_in is not None:
         return now + timedelta(seconds=args.test_in), f"test: now + {args.test_in:g} s"
@@ -776,6 +799,7 @@ def compute_target(args, clock: Clock) -> tuple[datetime, str]:
 
 
 def run(args) -> int:
+    """Audit, wait, tap. Returns the process exit code."""
     mode = "AUDIT" if args.audit else ("DRY-RUN" if args.dry_run else "LIVE")
     if args.test and not args.audit:
         mode += " + TEST TIME"
@@ -830,6 +854,7 @@ def run(args) -> int:
 
 
 def main() -> int:
+    """Entry point: parses arguments and maps errors to exit codes."""
     parser = build_parser()
     args = parser.parse_args()
     validate_args(parser, args)
