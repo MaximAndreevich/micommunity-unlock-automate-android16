@@ -653,6 +653,14 @@ def test_injection_delay_is_a_lower_bound():
     assert a.injection_delays([(100.0, 1e-6)], [99.990]) == []
 
 
+def test_injection_of_a_later_tap_is_not_matched():
+    # tap 1 logged nothing; tap 2 (start not printed) injected at 100.540: that is not
+    # tap 1's injection - it is longer than tap 1's own round-trip
+    assert a.injection_delays([(100.0, 1e-6)], [100.540], round_trips=[120.0]) == []
+    assert a.injection_delays([(100.0, 1e-6)], [100.070], round_trips=[120.0]) == \
+        pytest.approx([69.999])
+
+
 def test_tap_start_parsing():
     assert a.tap_start("miunlock_start=1791228293.267669\n") == \
         pytest.approx((1791228293.267669, 1e-6))

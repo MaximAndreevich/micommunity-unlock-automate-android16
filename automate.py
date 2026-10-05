@@ -653,12 +653,15 @@ def injection_times(logcat: str) -> list[float]:
     return [float(m.group(1)) for m in map(_INJECT_LOG_RE.search, logcat.splitlines()) if m]
 
 
-def injection_delays(starts: list[tuple[float, float]], injected: list[float]) -> list[float]:
+def injection_delays(starts: list[tuple[float, float]], injected: list[float],
+                     round_trips: list[float] | None = None) -> list[float]:
     """
     Start -> injection in ms for each tap: the first injection logged after its start and
     before the next tap's start (the DOWN event). A lower bound of the real delay: logcat
     truncates its time (earlier), the start is moved later by its resolution, and the
-    time before the shell started (PC -> device) counts as 0. Unmatched taps are left out.
+    time before the shell started (PC -> device) counts as 0. Unmatched taps are left out,
+    and so is a match longer than the tap's own round-trip (the event is injected before
+    the command returns, so it belongs to a later tap whose start was not printed).
     """
     delays = []
     for i, (start, resolution) in enumerate(starts):
@@ -668,7 +671,7 @@ def injection_delays(starts: list[tuple[float, float]], injected: list[float]) -
         if not hits:
             continue
         delay = (min(hits) - start - resolution) * 1000
-        if delay >= 0:
+        if delay >= 0 and (round_trips is None or delay <= round_trips[i]):
             delays.append(delay)
     return delays
 
@@ -955,6 +958,7 @@ def measure_tap_latency(dev: Device, target: Button, clock: Clock, deadline: dat
     since = device_time(dev)
     run_ = ProbeRun()
     starts: list[tuple[float, float]] = []
+    start_rtts: list[float] = []            # round-trips of the taps in `starts`
     for _ in range(count):
         if clock.now() >= deadline:
             log.warning("Latency probes stopped by the deadline after %d/%d.",
@@ -969,13 +973,14 @@ def measure_tap_latency(dev: Device, target: Button, clock: Clock, deadline: dat
             start = tap_start(res.output)
             if start:
                 starts.append(start)
+                start_rtts.append(latency)
         else:
             log.debug("Latency probe failed: %s", res.first_line_of_error())
         time.sleep(PROBE_GAP_SEC)
     time.sleep(0.3)    # let InputDispatcher deliver (and log) the last event
     logcat = read_logcat(dev, since)
     run_.denial = find_denial(logcat)
-    run_.inject_delays = injection_delays(starts, injection_times(logcat))
+    run_.inject_delays = injection_delays(starts, injection_times(logcat), start_rtts)
     if len(run_.inject_delays) < len(run_.round_trips):
         log.debug("Injection time found for %d/%d probes (start time printed for %d).",
                   len(run_.inject_delays), len(run_.round_trips), len(starts))
