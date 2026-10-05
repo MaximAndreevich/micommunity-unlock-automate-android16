@@ -21,10 +21,6 @@ load-plugins=pylint.extensions.check_elif,
 # Pickle collected data for later comparisons.
 persistent=yes
 
-# When enabled, pylint would attempt to guess common misconfiguration and emit
-# user-friendly hints instead of false-positive error messages.
-suggestion-mode=yes
-
 
 [MESSAGES CONTROL]
 # Disable the message, report, category or checker with the given id(s). You
