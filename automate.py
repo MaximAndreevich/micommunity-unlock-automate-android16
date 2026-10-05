@@ -27,6 +27,9 @@ Exit codes: 0 ok, 1 runtime error, 2 audit failed, 130 interrupted.
 
 from __future__ import annotations
 
+# single-file script on purpose: easy to download and run
+# pylint: disable=too-many-lines
+
 import argparse
 import logging
 import re
