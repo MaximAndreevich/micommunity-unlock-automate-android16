@@ -1,4 +1,6 @@
 # micommunity-unlock-request-automate
+[![CI](https://github.com/MaximAndreevich/micommunity-unlock-automate-android16/actions/workflows/ci.yml/badge.svg)](https://github.com/MaximAndreevich/micommunity-unlock-automate-android16/actions/workflows/ci.yml)
+
 Python script to automate Mi Community unlock request at 00:00 beijing time via `ADB`
 
 ## Credits / Origin
@@ -267,6 +269,8 @@ pip install -r requirements-dev.txt
 python -m pytest -q tests
 pylint automate.py
 ```
+GitHub Actions runs the same on every push and pull request (Python 3.10-3.13 on Linux,
+3.12 on macOS).
 
 ## Alternative
 This script below sends the request from the computer itself, instead of going through the Mi Community app.

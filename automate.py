@@ -45,7 +45,7 @@ import re
 import statistics
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -1016,7 +1016,9 @@ class CachedLatency:
 
 
 def _stats_to_json(stats: LatencyStats) -> dict:
-    return {"samples_ms": [round(x, 2) for x in stats.samples],
+    # samples at full precision: rounding 53.996 up to 54.0 would add 1 ms of compensation;
+    # the summary is rounded for people reading the file
+    return {"samples_ms": list(stats.samples),
             "min_ms": round(stats.min, 2), "median_ms": round(stats.median, 2),
             "p95_ms": round(stats.p95, 2)}
 
@@ -1047,6 +1049,8 @@ def save_cache(path: str, serial: str, measured: Measurement, api_host: str | No
         os.replace(tmp, path)
     except OSError as exc:
         log.warning("Could not save the latency cache %s: %s", path, exc)
+        with suppress(OSError):
+            os.remove(tmp)
         return
     log.info("Latency measurement saved to %s.", path)
 
