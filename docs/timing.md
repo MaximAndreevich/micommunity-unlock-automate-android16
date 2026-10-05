@@ -71,13 +71,27 @@ The log shows the mode, min/median/p95 of the measured delays, the compensation,
 the send moment in CST and local time and the earliest arrival at the server.
 `--dry-run` goes through the measurement and the calculation, only without the real tap.
 
+## The limit: a real tap faster than every probe
+The compensation is the fastest of ~20 probes, but the real tap is one more sample and can
+be faster still (on the same phone the minimum was 40 ms in one run and 53 ms in another).
+Only the margin covers that: a real tap up to `margin` ms faster than the compensation
+still reaches the phone after 00:00:00 CST, though no longer after 00:00:00 + margin;
+a tap faster by more than the margin is early.
+
+So the real tap is measured after the fact, the same way as the probes (start → injection
+on the phone clock, a lower bound). The log line `Real tap 1: start -> injection 40.0 ms
+(device clock), injected at 00:00:00.037 CST or later (target +37 ms)` gives the delay and
+the earliest moment the tap can have been injected: the PC moment the command was sent plus
+that delay. It warns when the tap was faster than the compensation, and when it may have
+been injected before the target.
+
 ## How it is tested
 All offline, on a simulated phone in virtual time (`tests/fakes.py`):
 - `tests/test_timing_invariants.py` — a grid of measurements (fast, slow, jittery,
   implausible) and options: the earliest possible arrival is never before
   target + 50 ms, the compensation is a whole number of ms and never more than the
   measured minimum; a full `--test-in 150` run checks the moment the fake phone
-  injects the real tap;
+  injects the real tap, also when the real tap is faster than every probe;
 - `tests/test_timing_properties.py` — the same rules for random measurements, options
   and targets (hypothesis), plus: the order of the samples does not matter, a slower
   sample never raises the compensation, and the measured start → injection delay is

@@ -1454,17 +1454,13 @@ def screen_texts(xml: str) -> list[str]:
 
 
 def verify_after_tap(dev: Device, button: Button, button_text: str,
-                     xml_before: str, since: str) -> tuple[bool, bool | None]:
+                     xml_before: str, logcat: str) -> tuple[bool, bool | None]:
     """
     Checks that the taps had an effect. Returns (ok, screen changed or None if unknown);
     ok is False if the device rejected them (logcat). An unchanged app screen is no
     error: the reply may have been a toast.
     """
-    try:
-        denial = logcat_denial(dev, since)
-    except DeviceError as exc:
-        log.warning("Could not check logcat for rejected taps: %s", exc)
-        denial = ""
+    denial = find_denial(logcat)
     if denial:
         log.error("The device rejected the taps: %s", denial)
         log.error(INJECT_HINT)
@@ -1532,9 +1528,62 @@ def save_app_logcat(dev: Device, since: str, out_dir: Path, prefix: str) -> None
     log.info("App logcat of the tap window saved to %s.", path)
 
 
-def after_tap(ses: Session, button: Button, xml_before: str, since: str,
-              last_tap_utc: datetime) -> bool:
-    """Screenshots, the denial / screen check and the app logcat after the last tap."""
+@dataclass
+class SentTap:
+    """A real tap whose command was accepted."""
+    sent_utc: datetime              # clock.now() right before the command was sent
+    result: ShellResult
+    round_trip_ms: float
+
+
+@dataclass
+class FiredTaps:
+    """The real taps, for the checks after them."""
+    plan: TimingPlan
+    since: str                      # device time before the taps (logcat window)
+    first_utc: datetime             # planned moment of the first tap ...
+    last_utc: datetime              # ... and of the last one
+    sent: list[SentTap] = field(default_factory=list)
+
+
+def report_tap_delays(logcat: str, fired: FiredTaps, target_utc: datetime) -> None:
+    """
+    Start -> injection of the real taps, measured after the fact like the probes (device
+    clock, a lower bound). The command starts on the phone after the PC sent it, so
+    sent_utc + that delay is the earliest moment the tap can have been injected, on the
+    PC clock - compared with the target and with the compensation the plan relied on.
+    """
+    injected = injection_times(logcat)
+    starts = [tap_start(tap.result.output) for tap in fired.sent]
+    compensation = fired.plan.compensation_ms
+    for i, (tap, start) in enumerate(zip(fired.sent, starts), 1):
+        end = next((later[0] for later in starts[i:] if later), math.inf)
+        delays = (injection_delays([start], [t for t in injected if t < end],
+                                   [tap.round_trip_ms]) if start else [])
+        if not delays:
+            log.info("Real tap %d: start -> injection unknown (%s).", i,
+                     "no injection line in logcat" if start else "no start time printed")
+            continue
+        earliest = tap.sent_utc + timedelta(milliseconds=delays[0])
+        after_ms = (earliest - target_utc).total_seconds() * 1000
+        log.info("Real tap %d: start -> injection %.1f ms (device clock), injected at %s CST "
+                 + "or later (target %+.0f ms).", i, delays[0],
+                 fmt_time(earliest, BEIJING_OFFSET), after_ms)
+        if delays[0] < compensation:
+            log.warning("Real tap %d was %.1f ms faster than the %d ms compensated "
+                        + "(margin %d ms).", i, compensation - delays[0], compensation,
+                        fired.plan.margin_ms)
+        if after_ms < 0:
+            log.warning("Real tap %d may have been injected %.0f ms before the target.",
+                        i, -after_ms)
+
+
+def after_tap(ses: Session, button: Button, xml_before: str, fired: FiredTaps) -> bool:
+    """
+    Screenshots, the denial / screen check, the delay of the real taps and the app
+    logcat after the last tap.
+    """
+    last_tap_utc, since = fired.last_utc, fired.since
     out_dir = evidence_dir(ses.args)
     prefix = "miunlock_" + last_tap_utc.astimezone().strftime("%Y%m%d-%H%M%S")
     shots = capture_screenshots(ses.dev, ses.clock, last_tap_utc, out_dir, prefix)
@@ -1543,7 +1592,13 @@ def after_tap(ses: Session, button: Button, xml_before: str, since: str,
     if wait > 0:
         log.info("Keeping the screen on for %.0f s while the request loads...", wait)
         time.sleep(wait)
-    ok, changed = verify_after_tap(ses.dev, button, ses.args.button_text, xml_before, since)
+    try:
+        logcat = read_logcat(ses.dev, since)
+    except DeviceError as exc:
+        log.warning("Could not check logcat for rejected taps: %s", exc)
+        logcat = ""
+    report_tap_delays(logcat, fired, ses.target_utc)
+    ok, changed = verify_after_tap(ses.dev, button, ses.args.button_text, xml_before, logcat)
     if changed is False:
         log.info("The app screen did not change; the reply may have been a toast - see "
                  + "the screenshots: %s", ", ".join(shots) or "none were saved")
@@ -1560,10 +1615,10 @@ def warn_if_late(i: int, count: int, due: datetime, now: datetime) -> None:
 
 
 def click(dev: Device, button: Button, clock: Clock, args,
-          planned: datetime | None = None) -> int:
+          fired: FiredTaps | None = None) -> int:
     """
-    Taps args.clicks times (the first one planned at `planned`). Returns the number of
-    taps injected successfully.
+    Taps args.clicks times (the first one planned at fired.first_utc). Returns the number
+    of taps injected successfully; the accepted ones are appended to fired.sent.
     """
     cmd = tap_command(button.x, button.y)
     count = args.clicks
@@ -1571,8 +1626,9 @@ def click(dev: Device, button: Button, clock: Clock, args,
     for i in range(1, count + 1):
         now = clock.now()
         stamp = fmt_time(now, BEIJING_OFFSET)
-        if planned is not None:
-            warn_if_late(i, count, planned + timedelta(seconds=args.delay * (i - 1)), now)
+        if fired is not None:
+            warn_if_late(i, count, fired.first_utc + timedelta(seconds=args.delay * (i - 1)),
+                         now)
         if args.dry_run:
             log.info("[DRY-RUN] tap %d/%d at %s CST: would run '%s'", i, count, stamp, cmd)
             done += 1
@@ -1584,6 +1640,8 @@ def click(dev: Device, button: Button, clock: Clock, args,
             else:
                 if res.ok:
                     done += 1
+                    if fired is not None:
+                        fired.sent.append(SentTap(now, res, latency))
                     # the stamp is taken before sending; the event lands up to `latency` later
                     log.info("Tap %d/%d sent at %s CST, input returned after %.0f ms.",
                              i, count, stamp, latency)
@@ -1835,10 +1893,11 @@ def fire(ses: Session, button: Button) -> int:
                                      need_inject=not args.dry_run)
     with dev.time_budget(2.0):
         since = device_time(dev)    # logcat window for the post-tap denial check
+    fired = FiredTaps(plan, since, send_utc,
+                      send_utc + timedelta(seconds=args.delay * (args.clicks - 1)))
     wait_until(send_utc, clock, dev, quiet=True)
-    done = click(dev, button, clock, args, planned=send_utc)
-    last_tap = send_utc + timedelta(seconds=args.delay * (args.clicks - 1))
-    if not args.dry_run and done and not after_tap(ses, button, xml_before, since, last_tap):
+    done = click(dev, button, clock, args, fired)
+    if not args.dry_run and done and not after_tap(ses, button, xml_before, fired):
         done = 0
     if done == args.clicks:
         log.info("[SUCCESS] %d/%d taps %s.", done, args.clicks,

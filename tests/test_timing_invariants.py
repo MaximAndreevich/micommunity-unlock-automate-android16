@@ -7,6 +7,7 @@ behind its own numbers.
 """
 
 import itertools
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -113,8 +114,18 @@ PROBES_MS = [66.38, 76.38, 63.02, 79.0, 64.44, 53.04, 63.94, 65.94, 73.48, 66.58
              73.24, 76.31, 72.76, 66.69, 53.06, 64.38, 74.93, 72.9, 79.56, 64.11]
 
 
+def reported_tap(caplog):
+    """(delay, ms after the target) from the log line about the real tap."""
+    [(delay, after)] = [
+        re.search(r"injection (\d+\.\d) ms .* \(target ([+-]\d+) ms\)", r.getMessage()).groups()
+        for r in caplog.records if r.getMessage().startswith("Real tap 1: start")]
+    return float(delay), int(after)
+
+
 @pytest.mark.parametrize("real_ms", [53.04, 40, 20, 3.5])
-def test_real_tap_faster_than_the_probes_still_lands_after_the_target(monkeypatch, real_ms):
+def test_real_tap_faster_than_the_probes_still_lands_after_the_target(monkeypatch, caplog,
+                                                                       real_ms):
+    caplog.set_level("INFO")
     dev = FakeDevice(inject_ms=PROBES_MS, tap_rt_ms=130, real_tap_inject_ms=real_ms)
     plan, target, _, injected = real_run(monkeypatch, dev, [])
     assert (plan.mode, plan.compensation_ms, plan.margin_ms) == ("adaptive", 53, 50)
@@ -123,11 +134,32 @@ def test_real_tap_faster_than_the_probes_still_lands_after_the_target(monkeypatc
     expected = target + ms(plan.margin_ms - (min(PROBES_MS) - real_ms))
     assert expected <= injected <= expected + ms(5)
 
+    # measured after the fact: a lower bound of the delay and of the moment
+    delay, after = reported_tap(caplog)
+    assert real_ms - 1.5 <= delay <= real_ms
+    assert 0 <= after <= (injected - target) / ms(1)
+    faster = "ms faster than the 53 ms compensated (margin 50 ms)" in caplog.text
+    assert faster == (delay < 53)
+    assert "before the target" not in caplog.text
 
-def test_real_tap_faster_than_the_probes_by_more_than_the_margin_is_early(monkeypatch):
+
+def test_real_tap_faster_than_the_probes_by_more_than_the_margin_is_early(monkeypatch, caplog):
     """The limit of the model, not a wish: nothing but the margin covers a real tap that
     is faster than every probe, so 130 ms faster with a 50 ms margin is a false start."""
+    caplog.set_level("INFO")
     dev = FakeDevice(inject_ms=[150, 160, 170], tap_rt_ms=250, real_tap_inject_ms=20)
     plan, target, _, injected = real_run(monkeypatch, dev, [])
     assert (plan.compensation_ms, plan.margin_ms) == (149, 50)     # 150 - the resolution
     assert injected < target - ms(70)
+    # the log says so after the tap
+    _, after = reported_tap(caplog)
+    assert after <= (injected - target) / ms(1) < 0
+    assert f"may have been injected {-after} ms before the target" in caplog.text
+
+
+def test_real_tap_delay_unknown_without_the_injection_line(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    dev = FakeDevice(inject_log=False)
+    assert run_with(monkeypatch, dev, ["--test-in", "150"]) == a.EXIT_OK
+    assert "Real tap 1: start -> injection unknown (no injection line in logcat)" \
+        in caplog.text
