@@ -1,9 +1,13 @@
-"""Timing invariants: whatever was measured and whatever the options, the tap never
-reaches the device (and so the server) before target + MIN_ARRIVAL_MS.
+"""Timing invariants: whatever was measured and whatever the options, the plan never
+lets the fastest measured tap arrive before target + MIN_ARRIVAL_MS.
 
-The checks (fakes.assert_timing_invariants) recompute the bounds from the measurement
-itself instead of trusting TimingPlan, so a wrong compensation_ms / send_time cannot hide
-behind its own numbers.
+Of the checks in fakes.assert_timing_invariants, only a few are independent of the code:
+send + the delay proven by the samples >= target + 50 ms, the compensation <= that delay,
+and the plausibility limit computed from the round-trips. The rest (send == target +
+margin - compensation, earliest_arrival == target + margin, the margin rules) restate the
+formulas of automate.py: consistency checks, no proof of safety. The proof rests on the
+end-to-end runs below (the moment the fake phone injects the real tap) and on the lower
+bound property of the measurement in test_timing_properties.py.
 """
 
 import itertools

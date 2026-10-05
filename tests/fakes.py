@@ -249,8 +249,10 @@ def proven_delay_ms(plan, measured):
 
 
 def assert_timing_invariants(plan, send, target, measured, args):
+    """The first group is computed from the samples, independently of automate.py; the
+    rest restates its formulas (consistency, not safety - see test_timing_invariants)."""
     proven = proven_delay_ms(plan, measured)
-    # no false start: even the fastest measured delivery arrives after target + 50 ms
+    # independent: even the fastest measured delivery arrives after target + 50 ms
     assert send + timedelta(milliseconds=proven) >= target + ms(a.MIN_ARRIVAL_MS)
     # the compensation is whole ms, never more than proven, wasting less than 1 ms
     assert isinstance(plan.compensation_ms, int)
@@ -262,7 +264,7 @@ def assert_timing_invariants(plan, send, target, measured, args):
         assert measured.inject.min <= measured.round_trip.min - adb
     else:
         assert plan.compensation_ms == 0
-    # send time and the bound it promises agree with the plan
+    # consistency: the send time and the bound it promises agree with the plan
     assert send == plan.send_time(target) == target + ms(plan.margin_ms - plan.compensation_ms)
     assert plan.earliest_arrival(target) == target + ms(plan.margin_ms)
     assert send >= target - ms(plan.compensation_ms)
