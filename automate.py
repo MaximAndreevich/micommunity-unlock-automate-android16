@@ -451,11 +451,7 @@ def probe_settings_write(dev: Device) -> tuple[bool, str]:
     return res.ok, ("" if res.ok else res.first_line_of_error())
 
 
-def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
-    """Runs all preflight checks without changing anything on the device."""
-    rep = AuditReport()
-
-    # --- device info
+def _audit_device_info(dev: Device, rep: AuditReport) -> None:
     sdk = dev.getprop("ro.build.version.sdk")
     release = dev.getprop("ro.build.version.release")
     brand = dev.getprop("ro.product.manufacturer")
@@ -465,7 +461,7 @@ def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
             f"{brand} {model} ({dev.serial}), Android {release} / SDK {sdk}"
             + (f", HyperOS/MIUI {hyperos}" if hyperos else ""))
 
-    if brand and brand.lower() not in ("xiaomi", "redmi", "poco"):
+    if brand and brand.lower() not in {"xiaomi", "redmi", "poco"}:
         rep.add("Manufacturer", Status.WARN, f"'{brand}' is not Xiaomi",
                 "Mi Community bootloader unlock only applies to Xiaomi devices.")
 
@@ -475,12 +471,8 @@ def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
                 region + ("" if "global" in region or "eea" in region
                           else "  <- China ROMs are not supported by this flow"))
 
-    # --- shell & permissions
-    if not dev.is_alive():
-        rep.add("ADB shell", Status.FAIL, "shell does not respond", "Replug USB, re-run.")
-        return rep
-    rep.add("ADB shell", Status.OK, "responds")
 
+def _audit_permissions(dev: Device, rep: AuditReport) -> None:
     probe = probe_input_injection(dev)
     rep.can_inject = probe.ok
     if probe.ok:
@@ -506,7 +498,8 @@ def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
     else:
         rep.add("Settings write (WRITE_SECURE_SETTINGS)", Status.WARN, err, SETTINGS_HINT)
 
-    # --- screen / app
+
+def _audit_screen(dev: Device, rep: AuditReport) -> None:
     awake = screen_awake(dev)
     if awake is False:
         rep.add("Screen", Status.FAIL, "screen is off",
@@ -527,42 +520,57 @@ def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
                 f"focused app is '{pkg}'",
                 "Open Mi Community -> Me -> Unlock bootloader and leave it on screen.")
 
-    # --- button
+
+def _audit_button(dev: Device, rep: AuditReport, button_text: str,
+                  save_dump: str | None) -> None:
     try:
         xml = dump_ui(dev)
-        rep.add("UI dump (uiautomator)", Status.OK, f"{len(xml)} bytes")
-        if args.save_dump:
-            with open(args.save_dump, "w", encoding="utf-8") as fh:
-                fh.write(xml)
-            rep.add("UI dump saved", Status.INFO, args.save_dump)
-        button = find_button(xml, args.button_text, BUTTON_RESOURCE_ID)
-        if button is None:
-            rep.add("Unlock button", Status.FAIL, f"'{args.button_text}' not found on screen",
-                    "Open the 'Unlock bootloader' page. If the app is not in English,\n"
-                    + "pass the button label with --button-text, or check --save-dump.")
-        else:
-            rep.button = button
-            status = Status.OK if button.enabled else Status.WARN
-            rep.add("Unlock button", status,
-                    f"({button.x}, {button.y}) bounds {button.bounds}, matched by "
-                    f"{button.matched_by}" + ("" if button.enabled else ", currently DISABLED"),
-                    "" if button.enabled else
-                    "The button is greyed out now; it may get enabled at reset time.")
-    except (DeviceError, ET.ParseError) as exc:
+    except DeviceError as exc:
         rep.add("UI dump (uiautomator)", Status.FAIL, str(exc),
                 "Make sure the screen is on and no system dialog covers the app.")
+        return
+    rep.add("UI dump (uiautomator)", Status.OK, f"{len(xml)} bytes")
+    if save_dump:
+        with open(save_dump, "w", encoding="utf-8") as fh:
+            fh.write(xml)
+        rep.add("UI dump saved", Status.INFO, save_dump)
 
-    # --- clock & latency
+    try:
+        button = find_button(xml, button_text, BUTTON_RESOURCE_ID)
+    except ET.ParseError as exc:
+        rep.add("UI dump (uiautomator)", Status.FAIL, f"invalid XML: {exc}",
+                "Re-run; if it persists, check the dump with --save-dump.")
+        return
+    if button is None:
+        rep.add("Unlock button", Status.FAIL, f"'{button_text}' not found on screen",
+                "Open the 'Unlock bootloader' page. If the app is not in English,\n"
+                + "pass the button label with --button-text, or check --save-dump.")
+        return
+    rep.button = button
+    if button.enabled:
+        rep.add("Unlock button", Status.OK,
+                f"({button.x}, {button.y}) bounds {button.bounds}, "
+                f"matched by {button.matched_by}")
+    else:
+        rep.add("Unlock button", Status.WARN,
+                f"({button.x}, {button.y}) bounds {button.bounds}, "
+                f"matched by {button.matched_by}, currently DISABLED",
+                "The button is greyed out now; it may get enabled at reset time.")
+
+
+def _audit_clock(clock: Clock, rep: AuditReport, no_ntp: bool) -> None:
     if clock.synced:
         status = Status.OK if abs(clock.offset) < 2 else Status.WARN
         rep.add("Clock", status, f"NTP offset {clock.offset:+.3f} s",
                 "Your PC clock is off - the NTP correction is applied anyway.")
-    elif args.no_ntp:
+    elif no_ntp:
         rep.add("Clock", Status.WARN, "NTP disabled (--no-ntp), local clock used")
     else:
         rep.add("Clock", Status.WARN, f"NTP {clock.server} unreachable, local clock used",
                 "Try --ntp-server time.google.com, or sync the PC clock.")
 
+
+def _audit_latency(dev: Device, rep: AuditReport) -> None:
     rtts = []
     for _ in range(5):
         t0 = time.perf_counter()
@@ -571,6 +579,22 @@ def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
     if rtts:
         rep.add("ADB latency", Status.INFO, f"median {statistics.median(rtts) * 1000:.0f} ms")
 
+
+def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
+    """Runs all preflight checks without changing anything on the device."""
+    rep = AuditReport()
+    _audit_device_info(dev, rep)
+
+    if not dev.is_alive():
+        rep.add("ADB shell", Status.FAIL, "shell does not respond", "Replug USB, re-run.")
+        return rep
+    rep.add("ADB shell", Status.OK, "responds")
+
+    _audit_permissions(dev, rep)
+    _audit_screen(dev, rep)
+    _audit_button(dev, rep, args.button_text, args.save_dump)
+    _audit_clock(clock, rep, args.no_ntp)
+    _audit_latency(dev, rep)
     return rep
 
 
