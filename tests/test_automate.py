@@ -97,6 +97,9 @@ def use_virtual_time(monkeypatch):
     monkeypatch.setattr(a.time, "sleep", fake_sleep)
 
 
+DRY = ["--dry-run", "--test-in", "5"]
+
+
 def run_with(monkeypatch, dev, argv):
     monkeypatch.setattr(a, "connect_device", lambda serial: dev)
     use_virtual_time(monkeypatch)
@@ -149,12 +152,12 @@ def test_next_occurrence_beijing_midnight():
 
 
 def test_audit_ok(monkeypatch):
-    assert run_with(monkeypatch, FakeDevice(), ["--audit"]) == a.EXIT_OK
+    assert run_with(monkeypatch, FakeDevice(), DRY) == a.EXIT_OK
 
 
 def test_audit_fails_without_inject_events(monkeypatch, caplog):
     dev = FakeDevice(inject=False, settings=False)
-    assert run_with(monkeypatch, dev, ["--audit"]) == a.EXIT_AUDIT
+    assert run_with(monkeypatch, dev, DRY) == a.EXIT_AUDIT
     assert "USB debugging (Security settings)" in caplog.text
     assert not dev.taps
 
@@ -166,12 +169,12 @@ def test_live_refuses_without_inject(monkeypatch):
 
 
 def test_lock_screen_detected(monkeypatch):
-    assert run_with(monkeypatch, FakeDevice(focus="NotificationShade"), ["--audit"]) \
+    assert run_with(monkeypatch, FakeDevice(focus="NotificationShade"), DRY) \
         == a.EXIT_AUDIT
 
 
 def test_other_app_in_foreground_fails(monkeypatch):
-    assert run_with(monkeypatch, FakeDevice(focus="com.android.chrome"), ["--audit"]) \
+    assert run_with(monkeypatch, FakeDevice(focus="com.android.chrome"), DRY) \
         == a.EXIT_AUDIT
 
 
@@ -184,13 +187,13 @@ def test_unknown_foreground_only_warns(monkeypatch, caplog):
             return a.ShellResult(cmd, 0, "  unrecognised output format")
         return real_run(cmd, timeout)
     dev.run = run
-    assert run_with(monkeypatch, dev, ["--audit"]) == a.EXIT_OK
+    assert run_with(monkeypatch, dev, DRY) == a.EXIT_OK
     assert "could not detect the focused app" in caplog.text
 
 
 def test_dry_run_no_taps_and_settings_restored(monkeypatch):
     dev = FakeDevice()
-    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "5"]) == a.EXIT_OK
+    assert run_with(monkeypatch, dev, DRY) == a.EXIT_OK
     assert dev.taps == []
     assert dev.store == {"global/stay_on_while_plugged_in": "0",
                          "system/screen_off_timeout": "30000"}

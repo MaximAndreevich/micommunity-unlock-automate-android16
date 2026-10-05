@@ -34,15 +34,16 @@ On newer HyperOS builds this toggle:
 - needs a signed-in Mi account (often also a SIM card and internet while you flip it);
 - can reset itself after a reboot/OTA or a failed account check.
 
-Toggle it OFF/ON, replug USB and run `python automate.py --audit` — it checks this
-without tapping anything. The same toggle also controls `settings put`
+Toggle it OFF/ON, replug USB and run `python automate.py --dry-run --test-in 5` —
+it checks this without tapping anything. The same toggle also controls `settings put`
 (keeping the screen on); without it the script still works, but you must set
 the screen timeout manually.
 
 ## Set up
 1. Open the Mi community app, switch to global region in the app settings
 2. Navigate to "Me -> Unlock Bootloader" and keep the screen at the page
-3. Connect the device to the computer, run `python automate.py --audit`, fix anything marked `FAIL`
+3. Connect the device to the computer, run `python automate.py --dry-run --test-in 5`,
+   fix anything marked `FAIL`
 4. Run the script.
 
 What the script does:
@@ -64,7 +65,7 @@ Exit codes: `0` ok, `1` runtime error, `2` audit failed, `130` interrupted.
 ```shell
 usage: automate.py [-h] [--clicks CLICKS] [--delay DELAY] [--lead-ms LEAD_MS]
                    [--serial SERIAL] [--button-text BUTTON_TEXT]
-                   [--ntp-server NTP_SERVER] [--no-ntp] [--audit] [--dry-run]
+                   [--ntp-server NTP_SERVER] [--no-ntp] [--dry-run]
                    [--force] [--test] [--test-time TEST_TIME]
                    [--test-timezone TEST_TIMEZONE] [--test-in SEC]
                    [--save-dump FILE] [--log-file FILE] [-v]
@@ -77,8 +78,7 @@ usage: automate.py [-h] [--clicks CLICKS] [--delay DELAY] [--lead-ms LEAD_MS]
   --ntp-server SERVER   default: pool.ntp.org
   --no-ntp              use the local clock only
 
-audit / testing:
-  --audit               run the preflight audit only and exit (no taps, no waiting)
+testing:
   --dry-run             do everything (audit, screen-on, wait) but do not tap
   --force               continue even if the audit has FAIL items (not recommended)
   --test                use --test-time/--test-timezone instead of 00:00 CST
@@ -91,27 +91,22 @@ audit / testing:
 ```
 
 ## Examples
-1. Check that everything is ready (no taps)
+1. Check that everything is ready: full rehearsal in 5 seconds without tapping
 ```shell
-python automate.py --audit
+python automate.py --dry-run --test-in 5
 ```
 
-2. Full rehearsal in 30 seconds without tapping
-```shell
-python automate.py --dry-run --test-in 30
-```
-
-3. Real tap test in 30 seconds (sends a real request!)
+2. Real tap test in 30 seconds (sends a real request!)
 ```shell
 python automate.py --test-in 30 --clicks 1
 ```
 
-4. Running the script normally, with a log file
+3. Running the script normally, with a log file
 ```shell
 python automate.py --log-file unlock.log
 ```
 
-5. Old-style test at a fixed time
+4. Old-style test at a fixed time
 ```shell
 python automate.py --test --test-timezone 2 --test-time 16:20
 ```

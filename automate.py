@@ -80,7 +80,8 @@ Notes:
     inserted + mobile data / internet on while you flip it).
   * On HyperOS 2/3 (Android 15/16) it often resets after a reboot or an OTA, and some
     builds silently reset it after ~a few minutes if the Mi account check fails.
-    Toggle it OFF and ON again, then unplug/replug USB and re-run with --audit.
+    Toggle it OFF and ON again, then unplug/replug USB and re-run with
+    --dry-run --test-in 5.
   * Re-authorise the computer if prompted ("Revoke USB debugging authorisations" helps
     when the toggle seems ignored).
   * Other OEMs: look for "Disable permission monitoring" (ColorOS/realme/OnePlus)."""
@@ -756,8 +757,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Automate the Mi Community unlock request at 00:00 Beijing time via ADB.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
-               "  automate.py --audit                 check permissions/setup and exit\n"
-               "  automate.py --dry-run --test-in 30  full rehearsal in 30 s, no taps\n"
+               "  automate.py --dry-run --test-in 5   check setup, rehearse in 5 s, no taps\n"
+               "  automate.py --test-in 30 --clicks 1 real tap in 30 s (sends a request!)\n"
                "  automate.py                         real run at 00:00 CST\n")
     p.add_argument("--clicks", type=int, default=2, help="number of taps (default: 2)")
     p.add_argument("--delay", type=float, default=2.0,
@@ -770,9 +771,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ntp-server", default=NTP_SERVER, help=f"default: {NTP_SERVER}")
     p.add_argument("--no-ntp", action="store_true", help="use the local clock only")
 
-    g = p.add_argument_group("audit / testing")
-    g.add_argument("--audit", action="store_true",
-                   help="run the preflight audit only and exit (no taps, no waiting)")
+    g = p.add_argument_group("testing")
     g.add_argument("--dry-run", action="store_true",
                    help="do everything (audit, screen-on, wait) but do not tap")
     g.add_argument("--force", action="store_true",
@@ -844,8 +843,8 @@ def compute_target(args, clock: Clock) -> tuple[datetime, str]:
 
 def run(args) -> int:
     """Audit, wait, tap. Returns the process exit code."""
-    mode = "AUDIT" if args.audit else ("DRY-RUN" if args.dry_run else "LIVE")
-    if args.test and not args.audit:
+    mode = "DRY-RUN" if args.dry_run else "LIVE"
+    if args.test:
         mode += " + TEST TIME"
     log.info("Mode: %s", mode)
 
@@ -855,9 +854,6 @@ def run(args) -> int:
 
     report = run_audit(dev, clock, args)
     report.print()
-
-    if args.audit:
-        return EXIT_AUDIT if report.failed else EXIT_OK
 
     if report.failed:
         if not args.force:
