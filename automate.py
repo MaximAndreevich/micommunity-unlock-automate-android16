@@ -99,10 +99,13 @@ EXIT_OK, EXIT_ERROR, EXIT_AUDIT, EXIT_INTERRUPTED = 0, 1, 2, 130
 _EXCEPTION_RE = re.compile(r"(Exception|Error)( occurred|:)|Permission denial", re.IGNORECASE)
 _SECURITY_RE = re.compile(
     r"SecurityException|INJECT_EVENTS|WRITE_SECURE_SETTINGS|Permission denial")
-# Some builds drop a rejected injection silently and only log it. Note that HyperOS logs
-# every injection as "MIUIInput: Input ... event injection from package" - not a denial.
+# Some builds drop a rejected injection silently and only log it. Only an input tag with
+# the text of a refusal counts: in the live run a denial at T-120 s cancels the attempt,
+# so a false match (e.g. a line about granting INJECT_EVENTS) would cost a day. Note that
+# HyperOS logs every injection as "MIUIInput: Input ... event injection from package".
 _LOGCAT_DENIED_RE = re.compile(
-    r"INJECT_EVENTS|Permission denied: injecting|injection (was )?(denied|failed|rejected)",
+    r"\b(InputDispatcher|InputManager[\w-]*|MIUIInput)\s*:.*?"
+    + r"(permission denied:? injecting|injection (was )?(denied|failed|rejected))",
     re.IGNORECASE)
 _DEVICE_TIME_RE = re.compile(r"\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}")
 _PING_TIME_RE = re.compile(r"time[=<]\s*(\d+(?:\.\d+)?)\s*ms")

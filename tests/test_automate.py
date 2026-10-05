@@ -457,6 +457,41 @@ def test_new_screen_text_after_tap_is_logged(caplog):
     assert "Screen changed after tapping" in caplog.text
 
 
+@pytest.mark.parametrize("line", [
+    LOGCAT_DENIAL,
+    "10-05 20:07:03.687  1500  1600 E InputManager: Input event injection failed: denied",
+    "10-05 20:07:03.687  1500  1600 W MIUIInput: injection was rejected for uid 2000",
+])
+def test_logcat_denial_lines_are_detected(line):
+    assert a._LOGCAT_DENIED_RE.search(line)
+
+
+@pytest.mark.parametrize("line", [
+    # granting the permission mentions INJECT_EVENTS but is not a refusal
+    "10-05 20:07:03.687  1500  1600 I PackageManager: grant android.permission.INJECT_EVENTS "
+    "to com.android.shell",
+    "10-05 20:07:03.687  1500  1600 D PermissionManager: INJECT_EVENTS granted=true",
+    # HyperOS logs every accepted injection
+    "10-05 20:07:03.687  2678 13244 W MIUIInput: Input motion event injection from package: "
+    "null action ACTION_DOWN",
+    # a refusal text under an unrelated tag
+    "10-05 20:07:03.687  4000  4001 W SomeApp: injection failed in my own test harness",
+])
+def test_logcat_lines_without_refusal_are_not_denials(line):
+    assert not a._LOGCAT_DENIED_RE.search(line)
+
+
+def test_inject_events_mention_does_not_cancel_live_run(monkeypatch):
+    monkeypatch.setattr(a.time, "sleep", lambda s: None)
+    dev = FakeDevice()
+    dev.logcat = ("10-05 20:07:03.687  1500  1600 I PackageManager: grant "
+                  "android.permission.INJECT_EVENTS to com.android.shell\n")
+    clock = FakeClock()
+    ses = a.Session(dev, clock, a.build_parser().parse_args([]),
+                    clock.t + timedelta(seconds=120), False)
+    a.probe_phase(ses, a.find_button(UI_XML, "Apply for unlocking", "x"))   # no raise
+
+
 def test_logcat_denial_after_tap_fails():
     dev = FakeDevice()
     dev.logcat = LOGCAT_DENIAL
