@@ -1016,7 +1016,9 @@ class CachedLatency:
 
 
 def _stats_to_json(stats: LatencyStats) -> dict:
-    return {"samples_ms": [round(x, 2) for x in stats.samples],
+    # samples at full precision: rounding 53.996 up to 54.0 would add 1 ms of compensation;
+    # the summary is rounded for people reading the file
+    return {"samples_ms": list(stats.samples),
             "min_ms": round(stats.min, 2), "median_ms": round(stats.median, 2),
             "p95_ms": round(stats.p95, 2)}
 
