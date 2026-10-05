@@ -1079,6 +1079,15 @@ class TimingPlan:
         return self.send_time(target_utc) + timedelta(milliseconds=self.compensation_ms)
 
 
+def injection_limit_ms(measured: Measurement) -> float:
+    """
+    Sanity limit of the device-side delay: the same command seen from the PC took at
+    least round_trip.min, and part of that is spent on the way over USB/TCP and back.
+    """
+    adb = measured.adb_rtt.min / 2 if measured.adb_rtt else 0.0
+    return measured.round_trip.min - adb
+
+
 def plan_timing(args, measured: Measurement | None, source: str) -> TimingPlan:
     """Picks the margin and compensation for --timing."""
     if args.timing == "fixed":
@@ -1087,6 +1096,12 @@ def plan_timing(args, measured: Measurement | None, source: str) -> TimingPlan:
         log.warning("Latency estimate impossible - using the standard margin of %d ms.",
                     args.margin_ms)
         return TimingPlan("fixed", args.margin_ms, "no latency estimate")
+    limit = injection_limit_ms(measured)
+    if measured.inject.min > limit:
+        log.error("Latency measurement error: start -> injection %.1f ms is longer than "
+                  + "the input round-trip minus half the ADB round-trip (%.1f ms) - using "
+                  + "fixed timing with %d ms.", measured.inject.min, limit, args.margin_ms)
+        return TimingPlan("fixed", args.margin_ms, "measurement error")
     margin = args.adaptive_margin_ms
     spread = measured.inject.p95 - measured.inject.min
     if spread > WIDE_SPREAD_MS:
@@ -1098,15 +1113,24 @@ def plan_timing(args, measured: Measurement | None, source: str) -> TimingPlan:
 
 def checked_send_time(plan: TimingPlan, target_utc: datetime) -> tuple[TimingPlan, datetime]:
     """
-    Guard against a false start: the request may never arrive before target + 50 ms.
-    A plan that breaks it is a calculation error - fall back to the fixed margin.
+    Guard against a false start. The compensation is a measured lower bound of the delay
+    (plan_timing rejects implausible measurements), so the request arrives no earlier than
+    send + compensation = target + margin; the guard checks the parts of that sum:
+    margin >= MIN_ARRIVAL_MS, compensation >= 0 and send >= target - compensation.
+    A plan that breaks them is a calculation error - fall back to the fixed margin.
     """
-    floor = target_utc + timedelta(milliseconds=MIN_ARRIVAL_MS)
-    if plan.compensation_ms < 0 or plan.earliest_arrival(target_utc) < floor:
-        log.error("Timing guard: the request could arrive at %s CST, before %s CST - "
-                  + "falling back to fixed timing with a %d ms margin.",
-                  fmt_time(plan.earliest_arrival(target_utc), BEIJING_OFFSET),
-                  fmt_time(floor, BEIJING_OFFSET), DEFAULT_MARGIN_MS)
+    send = plan.send_time(target_utc)
+    problems = []
+    if plan.margin_ms < MIN_ARRIVAL_MS:
+        problems.append(f"margin {plan.margin_ms} ms < {MIN_ARRIVAL_MS} ms")
+    if plan.compensation_ms < 0:
+        problems.append(f"negative compensation {plan.compensation_ms} ms")
+    if send < target_utc - timedelta(milliseconds=plan.compensation_ms):
+        problems.append(f"send at {fmt_time(send, BEIJING_OFFSET)} CST is earlier than "
+                        + "target - compensation")
+    if problems:
+        log.error("Timing guard: %s - falling back to fixed timing with a %d ms margin.",
+                  "; ".join(problems), DEFAULT_MARGIN_MS)
         plan = TimingPlan("fixed", DEFAULT_MARGIN_MS, "guard fallback")
     return plan, plan.send_time(target_utc)
 

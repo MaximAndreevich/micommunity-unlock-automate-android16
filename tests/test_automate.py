@@ -611,6 +611,33 @@ def test_guard_rejects_early_arrival(caplog):
                for r in caplog.records)
 
 
+def test_guard_rejects_small_fixed_margin(caplog):
+    plan, send = plan_for(["--timing", "fixed", "--margin-ms", "20"])
+    assert (plan.source, send) == ("guard fallback", T0 + ms(150))
+    assert "margin 20 ms < 50 ms" in caplog.text
+
+
+@pytest.mark.parametrize("adb, ok", [([30, 40], False), ([10, 12], True), (None, True)])
+def test_injection_delay_cannot_exceed_round_trip(caplog, adb, ok):
+    # input round-trip 110 ms; the device part cannot be longer than 110 - ADB RTT / 2
+    plan, send = plan_for([], samples=[100, 105], round_trip=[110, 130], adb=adb)
+    if ok:
+        assert (plan.mode, plan.compensation_ms) == ("adaptive", 100)
+    else:
+        assert (plan.mode, plan.source, send) == ("fixed", "measurement error", T0 + ms(150))
+        assert any(r.levelname == "ERROR" and "Latency measurement error" in r.getMessage()
+                   for r in caplog.records)
+
+
+def test_cached_implausible_measurement_is_rejected(monkeypatch, caplog, cache_file):
+    write_cache(cache_file, samples=(130, 135, 140))
+    data = json.loads(cache_file.read_text())
+    data["round_trip"] = {"samples_ms": [120, 125]}
+    cache_file.write_text(json.dumps(data))
+    assert run_with(monkeypatch, FakeDevice(), ["--dry-run", "--test-in", "30"]) == a.EXIT_OK
+    assert "Latency measurement error" in caplog.text
+
+
 @pytest.mark.parametrize("argv", [["--margin-ms", "-1"], ["--adaptive-margin-ms", "-5"],
                                   ["--probes", "1"], ["--api-host", "x; reboot"]])
 def test_bad_timing_args_rejected(argv):
