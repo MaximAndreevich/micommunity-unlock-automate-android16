@@ -1,6 +1,28 @@
 # micommunity-unlock-request-automate
 Python script to automate Mi Community unlock request at 00:00 beijing time via `ADB`
 
+## Credits / Origin
+This is a maintained continuation of
+[micommunity-unlock-request-automate](https://github.com/chkndrp/micommunity-unlock-request-automate)
+by **chickendrop89**. The original repository is archived, so changes cannot be sent upstream.
+Many thanks to chickendrop89 for the original script and the idea of driving the Mi Community
+app over ADB. The concept comes from
+[EstimateMuted4573 on Reddit](https://www.reddit.com/r/Android/comments/1mgn0yj/xiaomis_bootloader_unlock_system_is_broken_heres).
+
+What this fork changes:
+- HyperOS 3 / Android 16: checks `persist.security.adbinput` ("USB debugging (Security
+  settings)") instead of trusting probes that pass even with the toggle off;
+- a targeted injection probe: a tap on static text inside the Mi Community window, with a
+  logcat check for silent denials;
+- one tap by default and at most one request per minute;
+- a "rather late than early" timing model: the request must never reach the server before
+  00:00:00 CST;
+- measurement of the tap delay on the phone clock, with a cache of the last measurement;
+- checks right before firing: the toggle, the foreground app and the button position,
+  without injecting anything in the last minute; screenshots after the tap.
+
+The project stays under the GNU GPL v3 (see `LICENSE`).
+
 ## Why?
 On newer global HyperOS devices, Xiaomi has implemented another unlock step for unlocking
 the bootloader via the Mi Community app.
@@ -252,6 +274,3 @@ This script below sends the request from the computer itself, instead of going t
 However it is not cross-compatible with all OSes and environments (e.g. `Fedora`).
 
 [GetToken / AQLR script from XDA developers](https://xdaforums.com/t/how-to-unlock-bootloader-on-xiaomi-hyperos-all-devices-except-cn.4654009)
-
-## Credits
-Concept from [EstimateMuted4573 on Reddit](https://www.reddit.com/r/Android/comments/1mgn0yj/xiaomis_bootloader_unlock_system_is_broken_heres)

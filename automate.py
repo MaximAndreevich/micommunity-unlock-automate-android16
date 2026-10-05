@@ -1,5 +1,11 @@
 # Python script to automate Mi Community unlock request at 00:00 beijing time via ADB
 # Copyright (C) 2025 chickendrop89
+# Modifications Copyright (C) 2026 Maksim Tsvetkov
+#
+# This file has been modified from the original by chickendrop89
+# (https://github.com/chkndrp/micommunity-unlock-request-automate), last modified
+# 2026-10-05: HyperOS 3 / Android 16 support, preflight audit, timing and latency
+# measurement. See README "Credits / Origin" and the git history for details.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
