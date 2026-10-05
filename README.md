@@ -43,12 +43,12 @@ HyperOS 3 — only events delivered into another app's window are rejected. So t
 treats `adbinput=0` as a failure and probes by tapping static text inside the
 Mi Community window (a title, never the button).
 
-Toggle it OFF/ON, replug USB and run `python automate.py --dry-run --test-in 5`.
+Toggle it OFF/ON, replug USB and run `python automate.py --dry-run --test-in 90`.
 
 ## Set up
 1. Open the Mi community app, switch to global region in the app settings
 2. Navigate to "Me -> Unlock Bootloader" and keep the screen at the page
-3. Connect the device to the computer, run `python automate.py --dry-run --test-in 5`,
+3. Connect the device to the computer, run `python automate.py --dry-run --test-in 90`,
    fix anything marked `FAIL`
 4. Run the script.
 
@@ -59,19 +59,60 @@ What the script does:
    screen on, Mi Community in the foreground (not the lock screen), the button on screen, NTP clock.
    Any `FAIL` stops the script before it changes anything on the device.
 2. Keeps the screen on and saves the original values.
-3. Waits until 00:00:00 Beijing time minus `--lead-ms` (200 ms by default) using an NTP-corrected clock
+3. Waits until the send moment (see [Timing](#timing)) using an NTP-corrected clock
    (NTP is queried once, not in a loop). Re-checks the device and the Security settings
-   toggle every minute. 30 s before firing it dumps the UI again, re-locates the button
-   (the app may have restarted or scrolled) and repeats the in-app probe.
-4. Taps the button `--clicks` times and verifies that each tap was really injected
+   toggle every minute. Between T-120 s and T-60 s it repeats the in-app probe tap.
+   **In the last minute no input is injected except the real tap**: the heartbeat stops,
+   and the final check at T-20 s only reads the device state and dumps the UI again to
+   re-locate the button (the app may have restarted or scrolled). If the script is started
+   less than a minute before the target, the audit skips the in-app probe (WARN).
+4. Taps the button once (`--clicks`) and verifies that each tap was really injected
    (Android prints the exception but still exits with code 0, so the old version reported success anyway).
    Logs how long each `input` command took: it starts a JVM on the phone, so the tap lands
-   a few hundred ms after the logged time — tune `--lead-ms` with that number.
+   up to that long after the logged time.
    5 s later it checks logcat for rejected injections and logs only the new text on screen
    (Xiaomi's reply); an unchanged screen is reported as a warning.
 5. Restores the original screen settings — also on Ctrl+C and on errors.
 
+One tap is the default on purpose: Mi Community accepts one unlock request per minute,
+so a second tap 2 s later is wasted and may land in the dialog opened by the first one.
+With `--clicks > 1` the taps are at least 60 s apart (`--delay`, default 61 s).
+
 Exit codes: `0` ok, `1` runtime error, `2` audit failed, `130` interrupted.
+
+## Timing
+A request that reaches the server **before** 00:00:00 CST counts for the previous day
+(the quota is used up) and blocks the next request for a minute — the attempt is lost.
+Being 100–300 ms late costs little. So every error is made on the late side:
+
+```
+send = 00:00:00 CST + margin - compensation
+```
+
+Only **measured** delays are compensated, by their **minimum**; anything unmeasured counts as 0.
+
+- `--timing fixed`: no compensation, margin `--margin-ms` (150). The tap is sent at 00:00:00.150 CST.
+- `--timing adaptive` (default): between T-120 s and T-60 s the script times `--probes` (20)
+  taps on static text in the Mi Community window (never the button) and compensates the
+  minimal round-trip of `input`. With `--api-host HOST` it also pings HOST from the phone and
+  compensates half of the minimal RTT (no host is guessed; without the flag, or if ping does
+  not work, the network is not compensated). Margin `--adaptive-margin-ms` (50) covers NTP
+  error, network asymmetry and taps faster than the measured minimum; if the latency varies
+  a lot (p95 - min > 100 ms) the margin becomes 150 ms (WARN).
+- Started later than T-120 s, or the probes failed / were inconclusive: no fresh measurement.
+  Then the last saved measurement is used (WARN `using the one saved on <date>`), or, without
+  one, the standard 150 ms margin (WARN, fixed timing).
+- Every successful measurement is saved to `miunlock_latency.json` next to the script
+  (`--cache-file`): serial, connection type (usb / tcp), time, all samples, min/median/p95.
+  It is only used for the same serial and connection type and if it is not older than
+  `--cache-max-age-days` (7). A broken file is ignored with a warning. `--no-cache` turns
+  reading and writing off.
+- Guard: if the computed plan would let the request arrive before 00:00:00.050 CST, it is
+  treated as a calculation error (ERROR) and fixed timing with 150 ms is used.
+
+The log shows the mode, min/median/p95 of the measured delays, the compensation, the margin,
+the send moment in CST and local time and the earliest arrival at the server.
+`--dry-run` goes through the measurement and the calculation, only without the real tap.
 
 ## Long waits
 The script usually waits many hours. Keep in mind:
@@ -89,20 +130,33 @@ The script usually waits many hours. Keep in mind:
 
 ## Usage
 ```shell
-usage: automate.py [-h] [--clicks CLICKS] [--delay DELAY] [--lead-ms LEAD_MS]
-                   [--serial SERIAL] [--button-text BUTTON_TEXT]
-                   [--ntp-server NTP_SERVER] [--no-ntp] [--dry-run]
+usage: automate.py [-h] [--clicks CLICKS] [--delay DELAY] [--serial SERIAL]
+                   [--button-text BUTTON_TEXT] [--ntp-server NTP_SERVER] [--no-ntp]
+                   [--timing {adaptive,fixed}] [--margin-ms MARGIN_MS]
+                   [--adaptive-margin-ms ADAPTIVE_MARGIN_MS] [--probes PROBES]
+                   [--api-host HOST] [--cache-file FILE]
+                   [--cache-max-age-days DAYS] [--no-cache] [--dry-run]
                    [--force] [--test] [--test-time TEST_TIME]
                    [--test-timezone TEST_TIMEZONE] [--test-in SEC]
                    [--save-dump FILE] [--log-file FILE] [-v]
 
-  --clicks CLICKS       number of taps (default: 2)
-  --delay DELAY         delay between taps in seconds (default: 2.0)
-  --lead-ms LEAD_MS     fire this many ms before the target (default: 200)
+  --clicks CLICKS       number of taps (default: 1)
+  --delay DELAY         seconds between taps if --clicks > 1, at least 60 (default: 61)
   --serial SERIAL       device serial if several devices are connected
   --button-text TEXT    button label (default: 'Apply for unlocking'); resource-id is used as fallback
   --ntp-server SERVER   default: pool.ntp.org
   --no-ntp              use the local clock only
+
+timing:
+  --timing {adaptive,fixed}  default: adaptive
+  --margin-ms MS        fixed margin, also the fallback without an estimate (default: 150)
+  --adaptive-margin-ms MS    adaptive margin (default: 50; 150 if the latency varies a lot)
+  --probes N            latency probes between T-120 s and T-60 s (default: 20)
+  --api-host HOST       ping HOST from the phone, compensate half of the min RTT (default: off)
+  --cache-file FILE     latency cache (default: miunlock_latency.json next to the script)
+  --cache-max-age-days DAYS  ignore older measurements (default: 7)
+  --no-cache            neither read nor write the latency cache
+  --lead-ms             deprecated, ignored with a warning
 
 testing:
   --dry-run             do everything (audit, screen-on, wait) but do not tap
@@ -117,22 +171,27 @@ testing:
 ```
 
 ## Examples
-1. Check that everything is ready: full rehearsal in 5 seconds without tapping
+1. Check that everything is ready: full rehearsal in 90 seconds without tapping the button
 ```shell
-python automate.py --dry-run --test-in 5
+python automate.py --dry-run --test-in 90
 ```
 
-2. Real tap test in 30 seconds (sends a real request!)
+2. Full rehearsal including the latency measurement (starts it 150 s before the target)
 ```shell
-python automate.py --test-in 30 --clicks 1
+python automate.py --dry-run --test-in 150
 ```
 
-3. Running the script normally, with a log file
+3. Real tap test in 30 seconds (sends a real request!)
+```shell
+python automate.py --test-in 30
+```
+
+4. Running the script normally, with a log file
 ```shell
 python automate.py --log-file unlock.log
 ```
 
-4. Old-style test at a fixed time
+5. Old-style test at a fixed time
 ```shell
 python automate.py --test --test-timezone 2 --test-time 16:20
 ```

@@ -66,3 +66,7 @@ poetry.lock
 # OS / temporary files
 *.tmp
 *.temp
+
+# Latency measurement cache (automate.py)
+miunlock_latency.json
+miunlock_latency.json.tmp

@@ -3,6 +3,7 @@
 Run: python -m pytest -q tests
 """
 
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,6 +46,14 @@ SETTINGS_EXC = ("Exception occurred while executing 'put':\njava.lang.SecurityEx
                 "WRITE_SECURE_SETTINGS")
 
 
+@pytest.fixture(autouse=True)
+def cache_file(tmp_path, monkeypatch):
+    """Keeps tests away from the real latency cache next to the script."""
+    path = tmp_path / "latency.json"
+    monkeypatch.setattr(a, "DEFAULT_CACHE_FILE", str(path))
+    return path
+
+
 class FakeDevice(a.Device):
     def __init__(self, inject=True, settings=True, focus="com.mi.global.bbs", xml=UI_XML,
                  adbinput=None, brand="Xiaomi", silent_denial=False):
@@ -60,6 +69,7 @@ class FakeDevice(a.Device):
                       "system/screen_off_timeout": "30000"}
         self.taps = []
         self.commands = []
+        self.ping_output = ""                # "" = ping not available
 
     def run(self, cmd, timeout=30.0):
         self.commands.append(cmd)
@@ -84,6 +94,8 @@ class FakeDevice(a.Device):
                     self.taps.append(cmd)
                 else:
                     self.probe_taps.append(cmd)
+        elif cmd.startswith("ping"):
+            out, rc = self.ping_output, (0 if self.ping_output else 2)
         elif cmd.startswith("date"):
             out = "10-05 20:07:03.000"
         elif cmd.startswith("logcat"):
@@ -114,9 +126,12 @@ class FakeDevice(a.Device):
         return a.ShellResult(cmd, rc, out)
 
 
+VIRTUAL_START = 1_800_000_000.0
+
+
 def use_virtual_time(monkeypatch):
     """time.sleep() advances a virtual time.time(); every time() call costs 1 ms."""
-    now = [1_800_000_000.0]
+    now = [VIRTUAL_START]
 
     def fake_time():
         now[0] += 0.001
@@ -228,14 +243,39 @@ def test_missing_adbinput_on_other_brand_does_not_fail(monkeypatch):
 def test_audit_probes_inside_the_app_window(monkeypatch, caplog):
     caplog.set_level("INFO")
     dev = FakeDevice()
-    assert run_with(monkeypatch, dev, DRY) == a.EXIT_OK
-    assert dev.probe_taps == ["input tap 370 160"] * 2     # audit + final check
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "90"]) == a.EXIT_OK
+    assert dev.probe_taps == ["input tap 370 160"] * 2     # audit + T-90 s probe
     assert "in Mi Community accepted" in caplog.text
+
+
+def test_no_probe_in_the_last_minute(monkeypatch, caplog):
+    dev = FakeDevice()
+    assert run_with(monkeypatch, dev, DRY) == a.EXIT_OK
+    assert dev.probe_taps == []
+    assert "probe skipped: the target is less than a minute away" in caplog.text
+
+
+@pytest.mark.parametrize("test_in", ["90", "200", "3600"])
+def test_only_the_real_tap_in_the_last_minute(monkeypatch, test_in):
+    dev = FakeDevice()
+    inputs = []          # (virtual time, command)
+    real_run = dev.run
+
+    def run(cmd, timeout=30.0):
+        if cmd.startswith("input"):
+            inputs.append((a.time.time(), cmd))
+        return real_run(cmd, timeout)
+    dev.run = run
+    assert run_with(monkeypatch, dev, ["--test-in", test_in]) == a.EXIT_OK
+    (fired_at, tap), = [i for i in inputs if i[1] in dev.taps]
+    assert tap == "input tap 540 2070"
+    probes = [t for t, cmd in inputs if cmd != tap]
+    assert probes and all(fired_at - t > a.PROBE_END_SEC for t in probes)
 
 
 def test_audit_fails_on_silent_denial_in_logcat(monkeypatch, caplog):
     dev = FakeDevice(silent_denial=True, adbinput="")
-    assert run_with(monkeypatch, dev, ["--test-in", "5"]) == a.EXIT_AUDIT
+    assert run_with(monkeypatch, dev, ["--test-in", "90"]) == a.EXIT_AUDIT
     assert "Permission denied: injecting" in caplog.text
     assert not dev.taps
 
@@ -322,6 +362,25 @@ def test_ntp_resync_before_target(monkeypatch, wait_sec, expected_syncs):
     assert clock.t >= target
 
 
+def test_single_click_by_default():
+    args = a.build_parser().parse_args([])
+    assert (args.clicks, args.delay) == (1, 61)
+
+
+@pytest.mark.parametrize("argv", [["--clicks", "2", "--delay", "5"],
+                                  ["--clicks", "3", "--delay", "59.9"]])
+def test_fast_repeat_rejected(argv, capsys):
+    p = a.build_parser()
+    with pytest.raises(SystemExit):
+        a.validate_args(p, p.parse_args(argv))
+    assert "one unlock request per minute" in capsys.readouterr().err
+
+
+def test_delay_ignored_with_single_click():
+    p = a.build_parser()
+    a.validate_args(p, p.parse_args(["--delay", "5"]))
+
+
 def test_click_stops_after_security_denial(monkeypatch, caplog):
     monkeypatch.setattr(a.time, "sleep", lambda s: None)
     dev = FakeDevice(inject=False)
@@ -349,20 +408,31 @@ def test_final_check_stops_when_toggle_reset(monkeypatch):
         a.final_check(dev, "Apply for unlocking", button, need_inject=True)
 
 
-def test_final_check_stops_on_silent_denial(monkeypatch):
+@pytest.mark.parametrize("measure", [False, True])
+def test_probe_phase_stops_on_silent_denial(monkeypatch, measure):
     monkeypatch.setattr(a.time, "sleep", lambda s: None)
     dev = FakeDevice(silent_denial=True, adbinput="")
-    button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+    clock = FakeClock()
+    ses = a.Session(dev, clock, a.build_parser().parse_args([]),
+                    clock.t + timedelta(seconds=120), measure)
     with pytest.raises(a.DeviceError, match="Permission denied: injecting"):
-        a.final_check(dev, "Apply for unlocking", button, need_inject=True)
+        a.probe_phase(ses, a.find_button(UI_XML, "Apply for unlocking", "x"))
+
+
+def test_final_check_injects_nothing(monkeypatch):
+    monkeypatch.setattr(a.time, "sleep", lambda s: None)
+    dev = FakeDevice()
+    button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+    a.final_check(dev, "Apply for unlocking", button, need_inject=True)
+    assert not [c for c in dev.commands if c.startswith("input")]
 
 
 def test_taps_where_the_button_is_at_fire_time(monkeypatch, caplog):
     dev = FakeDevice()
     real_audit = a.run_audit
 
-    def audit_then_scroll(*args):
-        report = real_audit(*args)
+    def audit_then_scroll(*args, **kwargs):
+        report = real_audit(*args, **kwargs)
         dev.xml = UI_XML.replace("[100,2000][980,2140]", "[100,1800][980,1940]")
         return report
     monkeypatch.setattr(a, "run_audit", audit_then_scroll)
@@ -393,3 +463,223 @@ def test_logcat_denial_after_tap_fails():
     button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
     assert not a.verify_after_tap(dev, button, "Apply for unlocking", UI_XML,
                                   "10-05 20:07:03.000")
+
+
+# --------------------------------------------------------------------------- timing
+
+T0 = datetime(2026, 10, 6, 16, 0, tzinfo=timezone.utc)      # 00:00:00 CST
+
+
+def plan_for(argv, samples=None, net=None):
+    args = a.build_parser().parse_args(argv)
+    tap = a.LatencyStats(samples) if samples else None
+    plan = a.plan_timing(args, tap, a.LatencyStats(net) if net else None, "test")
+    return a.checked_send_time(plan, T0)
+
+
+def ms(n):
+    return timedelta(milliseconds=n)
+
+
+def test_fixed_timing_sends_at_150_ms():
+    plan, send = plan_for(["--timing", "fixed"], samples=[120, 125, 140])
+    assert (plan.mode, plan.compensation_ms) == ("fixed", 0)
+    assert send == T0 + ms(150)
+    assert send.astimezone(timezone(a.BEIJING_OFFSET)).strftime("%H:%M:%S.%f") \
+        == "00:00:00.150000"
+
+
+def test_adaptive_compensates_minimal_tap_latency():
+    plan, send = plan_for([], samples=[120, 125, 140])
+    assert (plan.mode, plan.margin_ms, plan.compensation_ms) == ("adaptive", 50, 120)
+    assert send == T0 + ms(50) - ms(120)
+    assert plan.earliest_arrival(T0) == T0 + ms(50)
+
+
+def test_adaptive_compensates_half_of_network_rtt():
+    plan, send = plan_for(["--api-host", "example.org"], samples=[120, 125, 140],
+                          net=[80, 90, 300])
+    assert plan.compensation_ms == 160
+    assert send == T0 + ms(50) - ms(160)
+
+
+def test_compensation_rounds_down():
+    plan, send = plan_for([], samples=[120.9, 125, 140])
+    assert plan.compensation_ms == 120
+    assert send == T0 - ms(70)
+
+
+def test_wide_spread_raises_margin(caplog):
+    plan, send = plan_for([], samples=[100, 110, 120, 400])
+    assert plan.margin_ms == 150
+    assert send == T0 + ms(150) - ms(100)
+    assert "Tap latency varies a lot" in caplog.text
+
+
+def test_no_estimate_falls_back_to_standard_margin(caplog):
+    plan, send = plan_for([])
+    assert (plan.mode, send) == ("fixed", T0 + ms(150))
+    assert "Latency estimate impossible - using the standard margin of 150 ms" \
+        in caplog.text
+
+
+def test_guard_rejects_early_arrival(caplog):
+    plan, send = plan_for(["--adaptive-margin-ms", "10"], samples=[120, 125, 140])
+    assert (plan.mode, send) == ("fixed", T0 + ms(150))
+    assert any(r.levelname == "ERROR" and "Timing guard" in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize("argv", [["--margin-ms", "-1"], ["--adaptive-margin-ms", "-5"],
+                                  ["--probes", "1"], ["--api-host", "x; reboot"]])
+def test_bad_timing_args_rejected(argv):
+    p = a.build_parser()
+    with pytest.raises(SystemExit):
+        a.validate_args(p, p.parse_args(argv))
+
+
+def test_lead_ms_is_ignored_with_warning(monkeypatch, caplog):
+    dev = FakeDevice()
+    assert run_with(monkeypatch, dev, DRY + ["--lead-ms", "200"]) == a.EXIT_OK
+    assert "--lead-ms is deprecated and ignored" in caplog.text
+
+
+def test_adaptive_run_measures_in_the_probe_window(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    dev = FakeDevice()
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
+    assert len(dev.probe_taps) == 1 + 20         # audit + latency probes
+    assert dev.taps == []                        # dry run: no real tap
+    assert "Tap latency measured" in caplog.text
+    assert "Timing: adaptive (measured)" in caplog.text
+    assert "request reaches the server no earlier than" in caplog.text
+
+
+def test_adaptive_run_pings_api_host(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    dev = FakeDevice()
+    dev.ping_output = "\n".join(f"64 bytes from 1.2.3.4: icmp_seq={i} ttl=50 time={t} ms"
+                                for i, t in enumerate([41.5, 40.2, 55.0]))
+    argv = ["--dry-run", "--test-in", "150", "--api-host", "example.org"]
+    assert run_with(monkeypatch, dev, argv) == a.EXIT_OK
+    assert "Network RTT to example.org measured: min 40" in caplog.text
+    assert "compensation 20 ms" in caplog.text   # tap latency ~0 ms in the fake
+
+
+def test_unavailable_ping_is_not_compensated(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    argv = ["--dry-run", "--test-in", "150", "--api-host", "example.org"]
+    assert run_with(monkeypatch, FakeDevice(), argv) == a.EXIT_OK
+    assert "ping example.org from the phone is not available" in caplog.text
+    assert "compensation 0 ms, margin 50 ms" in caplog.text
+
+
+def test_late_start_does_not_measure(monkeypatch, caplog):
+    dev = FakeDevice()
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "100"]) == a.EXIT_OK
+    assert len(dev.probe_taps) == 2              # audit + one injection probe, no timing
+    assert "no latency measurement" in caplog.text
+    assert "using the standard margin of 150 ms" in caplog.text
+
+
+def test_failed_probes_are_inconclusive(monkeypatch, caplog):
+    dev = FakeDevice()
+    real_run = dev.run
+
+    def run(cmd, timeout=30.0):
+        if cmd == "input tap 370 160" and len(dev.probe_taps) > 1:
+            return a.ShellResult(cmd, 1, "Error: injection timed out")
+        return real_run(cmd, timeout)
+    dev.run = run
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
+    assert "Latency measurement inconclusive" in caplog.text
+    assert "using the standard margin of 150 ms" in caplog.text
+
+
+# --------------------------------------------------------------------------- cache
+
+def write_cache(path, serial="fake123", connection="usb", age=timedelta(hours=1),
+                samples=(120, 125, 140), now=None):
+    now = now or datetime.fromtimestamp(VIRTUAL_START, timezone.utc)
+    path.write_text(json.dumps({
+        "serial": serial, "connection": connection,
+        "measured_at": (now - age).isoformat(),
+        "tap": {"samples_ms": list(samples)}, "net": None, "api_host": None}))
+
+
+def test_measurement_is_saved(monkeypatch, cache_file):
+    assert run_with(monkeypatch, FakeDevice(), ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
+    data = json.loads(cache_file.read_text())
+    assert (data["serial"], data["connection"]) == ("fake123", "usb")
+    assert len(data["tap"]["samples_ms"]) == 20
+    assert {"min_ms", "median_ms", "p95_ms"} <= data["tap"].keys()
+    assert datetime.fromisoformat(data["measured_at"]).tzinfo is not None
+
+
+def test_late_start_without_cache_uses_standard_margin(monkeypatch, caplog, cache_file):
+    caplog.set_level("INFO")
+    assert run_with(monkeypatch, FakeDevice(), ["--dry-run", "--test-in", "30"]) == a.EXIT_OK
+    assert "Latency estimate impossible - using the standard margin of 150 ms" \
+        in caplog.text
+    assert "compensation 0 ms, margin 150 ms" in caplog.text
+    assert not cache_file.exists()
+
+
+def test_late_start_uses_cache(monkeypatch, caplog, cache_file):
+    caplog.set_level("INFO")
+    write_cache(cache_file)
+    dev = FakeDevice()
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "30"]) == a.EXIT_OK
+    assert "Latency measurement not possible - using the one saved on" in caplog.text
+    assert "compensation 120 ms, margin 50 ms" in caplog.text
+    assert dev.probe_taps == []
+
+
+def test_no_cache_flag(monkeypatch, caplog, cache_file):
+    write_cache(cache_file)
+    before = cache_file.read_text()
+    assert run_with(monkeypatch, FakeDevice(),
+                    ["--dry-run", "--test-in", "30", "--no-cache"]) == a.EXIT_OK
+    assert "using the standard margin of 150 ms" in caplog.text
+    assert run_with(monkeypatch, FakeDevice(),
+                    ["--dry-run", "--test-in", "150", "--no-cache"]) == a.EXIT_OK
+    assert cache_file.read_text() == before
+
+
+def test_cache_used_only_for_the_same_device_and_fresh(cache_file):
+    now = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
+    write_cache(cache_file, now=now, age=timedelta(days=6, hours=23))
+    assert a.load_cache(str(cache_file), "fake123", 7, now).tap.min == 120
+    for kwargs in ({"serial": "other"}, {"connection": "tcp"},
+                   {"age": timedelta(days=7, minutes=1)}, {"age": -timedelta(days=1)}):
+        write_cache(cache_file, now=now, **kwargs)
+        assert a.load_cache(str(cache_file), "fake123", 7, now) is None, kwargs
+
+
+def test_tcp_cache_matches_tcp_serial(cache_file):
+    now = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
+    write_cache(cache_file, serial="192.168.1.5:5555", connection="tcp", now=now)
+    assert a.load_cache(str(cache_file), "192.168.1.5:5555", 7, now) is not None
+    assert a.connection_type("adb-abc._adb-tls-connect._tcp") == "tcp"
+    assert a.connection_type("a1b2c3d4") == "usb"
+
+
+@pytest.mark.parametrize("content", ["{not json", "[]", '{"serial": "fake123"}',
+                                     '{"serial": "fake123", "connection": "usb", '
+                                     '"measured_at": "2026-10-06T10:00:00", '
+                                     '"tap": {"samples_ms": [100]}}',
+                                     '{"serial": "fake123", "connection": "usb", '
+                                     '"measured_at": "2026-10-06T10:00:00+00:00", '
+                                     '"tap": {"samples_ms": []}}'])
+def test_broken_cache_is_ignored(cache_file, caplog, content):
+    cache_file.write_text(content)
+    now = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
+    assert a.load_cache(str(cache_file), "fake123", 7, now) is None
+    assert "ignored" in caplog.text
+
+
+def test_broken_cache_does_not_stop_the_run(monkeypatch, caplog, cache_file):
+    cache_file.write_text("{not json")
+    assert run_with(monkeypatch, FakeDevice(), ["--dry-run", "--test-in", "30"]) == a.EXIT_OK
+    assert "is unreadable" in caplog.text
+    assert "using the standard margin of 150 ms" in caplog.text

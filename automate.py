@@ -31,7 +31,10 @@ from __future__ import annotations
 # pylint: disable=too-many-lines
 
 import argparse
+import json
 import logging
+import math
+import os
 import re
 import statistics
 import sys
@@ -39,6 +42,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import ntplib
@@ -52,7 +56,19 @@ BUTTON_TEXT = "Apply for unlocking"
 BUTTON_RESOURCE_ID = "com.mi.global.bbs:id/btnApply"
 
 BEIJING_OFFSET = timedelta(hours=8)
-DEFAULT_LEAD_MS = 200            # fire 200 ms before 00:00:00 (= old 23:59:59.800)
+# Send moment = target + margin - compensation. A request that reaches the server before
+# 00:00:00 CST counts for the previous day (quota used up) and blocks the next one for a
+# minute, so every error must make it late, never early: only measured delays are
+# compensated (by their minimum), unmeasured ones count as 0.
+DEFAULT_MARGIN_MS = 150          # fixed mode, and the fallback without a measurement
+DEFAULT_ADAPTIVE_MARGIN_MS = 50  # covers NTP error, network asymmetry, faster-than-min taps
+WIDE_SPREAD_MS = 100             # tap latency p95 - min above this is unreliable ...
+WIDE_SPREAD_MARGIN_MS = 150      # ... and gets this margin
+MIN_ARRIVAL_MS = 50              # guard: the request may never arrive before target + this
+DEFAULT_PROBES = 20              # latency probes (taps on static text, never the button)
+PROBE_GAP_SEC = 0.1
+DEFAULT_CACHE_FILE = str(Path(__file__).resolve().with_name("miunlock_latency.json"))
+DEFAULT_CACHE_MAX_AGE_DAYS = 7.0
 NTP_SERVER = "pool.ntp.org"
 NTP_SAMPLES = 4
 
@@ -65,8 +81,17 @@ SCREEN_TIMEOUT_MAX = "2147483647"
 ADBINPUT_PROP = "persist.security.adbinput"   # Xiaomi: "USB debugging (Security settings)"
 
 HEARTBEAT_SEC = 60.0             # how often to re-check the device while waiting
-FINAL_CHECK_SEC = 30.0           # last full check (UI dump + probe) this long before firing
-NTP_RESYNC_SEC = 60.0            # re-query NTP this many seconds before firing
+NTP_RESYNC_SEC = 60.0            # re-query NTP this many seconds before a long wait ends
+# Schedule relative to the target T. Taps into the app (always on static text, never the
+# button) only happen before T-60 s; after that only checks without input and the real tap.
+PROBE_START_SEC = 120.0          # in-app probes / latency measurement start at T-120 s ...
+PROBE_END_SEC = 60.0             # ... and must be done by T-60 s
+PROBE_MIN_SEC = 5.0              # no probes if less than this is left before T-60 s
+FINAL_CHECK_SEC = 20.0           # last check (state + UI dump, no input) at T-20 s
+PROBE_SAFETY_SEC = 2.0           # the last probe must start this long before T-60 s
+
+MIN_CLICK_DELAY_SEC = 60.0       # the server accepts one unlock request per minute
+DEFAULT_CLICK_DELAY_SEC = 61.0
 
 EXIT_OK, EXIT_ERROR, EXIT_AUDIT, EXIT_INTERRUPTED = 0, 1, 2, 130
 
@@ -80,6 +105,8 @@ _LOGCAT_DENIED_RE = re.compile(
     r"INJECT_EVENTS|Permission denied: injecting|injection (was )?(denied|failed|rejected)",
     re.IGNORECASE)
 _DEVICE_TIME_RE = re.compile(r"\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}")
+_PING_TIME_RE = re.compile(r"time[=<]\s*(\d+(?:\.\d+)?)\s*ms")
+_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:-]*")
 
 INJECT_HINT = """\
 The shell user is not allowed to inject input (INJECT_EVENTS).
@@ -93,7 +120,7 @@ Notes:
   * On HyperOS 2/3 (Android 15/16) it often resets after a reboot or an OTA, and some
     builds silently reset it after ~a few minutes if the Mi account check fails.
     Toggle it OFF and ON again, then unplug/replug USB and re-run with
-    --dry-run --test-in 5.
+    --dry-run --test-in 90.
   * Re-authorise the computer if prompted ("Revoke USB debugging authorisations" helps
     when the toggle seems ignored).
   * Other OEMs: look for "Disable permission monitoring" (ColorOS/realme/OnePlus)."""
@@ -596,8 +623,7 @@ def _audit_device_info(dev: Device, rep: AuditReport) -> None:
                           else "  <- China ROMs are not supported by this flow"))
 
 
-def _audit_permissions(dev: Device, rep: AuditReport) -> None:
-    name = "Input injection (INJECT_EVENTS)"
+def _audit_inject_probe(dev: Device, rep: AuditReport, name: str) -> None:
     probe = probe_input_injection(dev, rep.probe_target)
     rep.can_inject = probe.ok
     if probe.denied:
@@ -614,6 +640,17 @@ def _audit_permissions(dev: Device, rep: AuditReport) -> None:
                 "No static text to tap was found in the Mi Community window, so it is\n"
                 + "not proven that taps reach the app. Check --save-dump.")
     rep.add("Input tap round-trip", Status.INFO, f"{probe.latency_ms:.0f} ms")
+
+
+def _audit_permissions(dev: Device, rep: AuditReport, allow_probe: bool) -> None:
+    name = "Input injection (INJECT_EVENTS)"
+    if allow_probe:
+        _audit_inject_probe(dev, rep, name)
+    else:
+        rep.can_inject = True     # only persist.security.adbinput below can veto it
+        rep.add(name, Status.WARN, "probe skipped: the target is less than a minute away",
+                "No input is injected in the last minute before the target except the\n"
+                + "real tap. Start earlier (e.g. --test-in 90) to probe a tap into the app.")
 
     # On Xiaomi this property is the "USB debugging (Security settings)" toggle itself.
     # The probe above cannot be trusted on its own: events that reach no app window
@@ -717,8 +754,11 @@ def _audit_latency(dev: Device, rep: AuditReport) -> None:
         rep.add("ADB latency", Status.INFO, f"median {statistics.median(rtts) * 1000:.0f} ms")
 
 
-def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
-    """Runs all preflight checks without changing anything on the device."""
+def run_audit(dev: Device, clock: Clock, args, allow_probe: bool = True) -> AuditReport:
+    """
+    Runs all preflight checks without changing anything on the device.
+    allow_probe=False skips the in-app tap probe (the target is less than a minute away).
+    """
     rep = AuditReport()
     _audit_device_info(dev, rep)
 
@@ -730,10 +770,247 @@ def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
     # the UI dump comes first: the injection probe taps static text found in it
     _audit_screen(dev, rep)
     _audit_button(dev, rep, args.button_text, args.save_dump)
-    _audit_permissions(dev, rep)
+    _audit_permissions(dev, rep, allow_probe)
     _audit_clock(clock, rep, args.no_ntp)
     _audit_latency(dev, rep)
     return rep
+
+
+# --------------------------------------------------------------------------- timing
+
+@dataclass
+class LatencyStats:
+    """Latency samples in ms."""
+    samples: list[float]
+
+    @property
+    def min(self) -> float:
+        """Smallest sample - the only safe value to compensate by."""
+        return min(self.samples)
+
+    @property
+    def median(self) -> float:
+        """Median sample."""
+        return statistics.median(self.samples)
+
+    @property
+    def p95(self) -> float:
+        """95th percentile (nearest rank)."""
+        ordered = sorted(self.samples)
+        return ordered[math.ceil(0.95 * len(ordered)) - 1]
+
+    def describe(self) -> str:
+        """min / median / p95 for the log."""
+        return (f"min {self.min:.0f} / median {self.median:.0f} / p95 {self.p95:.0f} ms "
+                f"(n={len(self.samples)})")
+
+
+@dataclass
+class Measurement:
+    """Measured delays: input tap round-trip, optionally the network RTT to the API host."""
+    click: LatencyStats
+    net: LatencyStats | None = None
+
+
+def measure_click_latency(dev: Device, target: Button, clock: Clock, deadline: datetime,
+                          count: int) -> tuple[list[float], str]:
+    """
+    Times `count` taps on static text of the Mi Community window (never the button),
+    stopping at `deadline`. Returns the round-trips in ms and a denial ('' if none).
+    """
+    since = device_time(dev)
+    samples: list[float] = []
+    for _ in range(count):
+        if clock.now() >= deadline:
+            log.warning("Latency probes stopped by the deadline after %d/%d.",
+                        len(samples), count)
+            break
+        res, latency = timed_run(dev, f"input tap {target.x} {target.y}")
+        if res.security_denied:
+            return samples, res.first_line_of_error()
+        if res.ok:
+            samples.append(latency)
+        else:
+            log.debug("Latency probe failed: %s", res.first_line_of_error())
+        time.sleep(PROBE_GAP_SEC)
+    time.sleep(0.3)    # let InputDispatcher deliver (and log) the last event
+    return samples, logcat_denial(dev, since)
+
+
+def measure_network_rtt(dev: Device, host: str, count: int, budget_sec: float) -> list[float]:
+    """RTTs in ms of `ping` from the phone to host ([] if ping is unavailable)."""
+    deadline = max(1, int(budget_sec))
+    try:
+        res = dev.run(f"ping -c {count} -i 0.2 -W 1 -w {deadline} {host}",
+                      timeout=deadline + 5)
+    except DeviceError as exc:
+        log.debug("ping failed: %s", exc)
+        return []
+    samples = [float(m) for m in _PING_TIME_RE.findall(res.output)]
+    if not samples:
+        log.debug("ping output: %s", res.output.strip()[:200])
+    return samples
+
+
+def connection_type(serial: str) -> str:
+    """'tcp' for adb over the network (host:port or an mDNS service name), else 'usb'."""
+    return "tcp" if re.fullmatch(r".+:\d+", serial) or "._tcp" in serial else "usb"
+
+
+@dataclass
+class CachedLatency:
+    """A measurement saved by an earlier run."""
+    measured_at: datetime
+    tap: LatencyStats
+    net: LatencyStats | None
+    api_host: str | None
+
+
+def _stats_to_json(stats: LatencyStats) -> dict:
+    return {"samples_ms": [round(x, 2) for x in stats.samples],
+            "min_ms": round(stats.min, 2), "median_ms": round(stats.median, 2),
+            "p95_ms": round(stats.p95, 2)}
+
+
+def _stats_from_json(obj: dict) -> LatencyStats:
+    samples = [float(x) for x in obj["samples_ms"]]
+    if not samples or not all(math.isfinite(x) and x >= 0 for x in samples):
+        raise ValueError("bad samples_ms")
+    return LatencyStats(samples)
+
+
+def save_cache(path: str, serial: str, measured: Measurement, api_host: str | None,
+               now: datetime) -> None:
+    """Saves a successful measurement (never fails the run)."""
+    data = {"serial": serial, "connection": connection_type(serial),
+            "measured_at": now.isoformat(), "tap": _stats_to_json(measured.click),
+            "net": _stats_to_json(measured.net) if measured.net else None,
+            "api_host": api_host if measured.net else None}
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("Could not save the latency cache %s: %s", path, exc)
+        return
+    log.info("Latency measurement saved to %s.", path)
+
+
+def load_cache(path: str, serial: str, max_age_days: float,
+               now: datetime) -> CachedLatency | None:
+    """
+    The saved measurement if it is for this device and connection type and not too old.
+    A broken file is ignored with a warning.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        log.debug("No latency cache at %s.", path)
+        return None
+    except (OSError, ValueError) as exc:
+        log.warning("Latency cache %s is unreadable (%s) - ignored.", path, exc)
+        return None
+    try:
+        cached = CachedLatency(
+            datetime.fromisoformat(data["measured_at"]), _stats_from_json(data["tap"]),
+            _stats_from_json(data["net"]) if data.get("net") else None, data.get("api_host"))
+        age = now - cached.measured_at      # TypeError if measured_at has no time zone
+        same_device = (data["serial"], data["connection"]) == (serial, connection_type(serial))
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        log.warning("Latency cache %s is broken (%s) - ignored.", path, exc)
+        return None
+    if not same_device:
+        log.info("Latency cache %s is for %s over %s - not used.", path, data["serial"],
+                 data["connection"])
+        return None
+    if not timedelta(hours=-1) <= age <= timedelta(days=max_age_days):
+        log.info("Latency cache %s is from %s, not within %g days - not used.", path,
+                 cached.measured_at.isoformat(timespec="seconds"), max_age_days)
+        return None
+    return cached
+
+
+@dataclass
+class TimingPlan:
+    """When to send the tap: target + margin - compensation."""
+    mode: str                       # "adaptive" or "fixed"
+    margin_ms: int
+    source: str
+    click: LatencyStats | None = None
+    net: LatencyStats | None = None
+
+    @property
+    def compensation_ms(self) -> int:
+        """Measured delays only, by their minimum; rounded down (later is safe)."""
+        if self.mode != "adaptive" or self.click is None:
+            return 0
+        net = self.net.min / 2 if self.net else 0.0
+        return math.floor(self.click.min + net)
+
+    def send_time(self, target_utc: datetime) -> datetime:
+        """Moment to run the input command."""
+        return target_utc + timedelta(milliseconds=self.margin_ms - self.compensation_ms)
+
+    def earliest_arrival(self, target_utc: datetime) -> datetime:
+        """Lower bound of when the request reaches the server."""
+        return self.send_time(target_utc) + timedelta(milliseconds=self.compensation_ms)
+
+
+def plan_timing(args, tap: LatencyStats | None, net: LatencyStats | None,
+                source: str) -> TimingPlan:
+    """Picks the margin and compensation for --timing."""
+    if args.timing == "fixed":
+        return TimingPlan("fixed", args.margin_ms, "--timing fixed")
+    if tap is None:
+        log.warning("Latency estimate impossible - using the standard margin of %d ms.",
+                    args.margin_ms)
+        return TimingPlan("fixed", args.margin_ms, "no latency estimate")
+    margin = args.adaptive_margin_ms
+    spread = tap.p95 - tap.min
+    if spread > WIDE_SPREAD_MS:
+        margin = max(margin, WIDE_SPREAD_MARGIN_MS)
+        log.warning("Tap latency varies a lot (p95 - min = %.0f ms > %d ms) - margin %d ms.",
+                    spread, WIDE_SPREAD_MS, margin)
+    return TimingPlan("adaptive", margin, source, tap, net)
+
+
+def checked_send_time(plan: TimingPlan, target_utc: datetime) -> tuple[TimingPlan, datetime]:
+    """
+    Guard against a false start: the request may never arrive before target + 50 ms.
+    A plan that breaks it is a calculation error - fall back to the fixed margin.
+    """
+    floor = target_utc + timedelta(milliseconds=MIN_ARRIVAL_MS)
+    if plan.compensation_ms < 0 or plan.earliest_arrival(target_utc) < floor:
+        log.error("Timing guard: the request could arrive at %s CST, before %s CST - "
+                  + "falling back to fixed timing with a %d ms margin.",
+                  fmt_time(plan.earliest_arrival(target_utc), BEIJING_OFFSET),
+                  fmt_time(floor, BEIJING_OFFSET), DEFAULT_MARGIN_MS)
+        plan = TimingPlan("fixed", DEFAULT_MARGIN_MS, "guard fallback")
+    return plan, plan.send_time(target_utc)
+
+
+def fmt_time(moment: datetime, offset: timedelta | None = None) -> str:
+    """HH:MM:SS.fff in the given UTC offset (None = local time)."""
+    tz = timezone(offset) if offset is not None else None
+    return moment.astimezone(tz).strftime("%H:%M:%S.%f")[:-3]
+
+
+def log_plan(plan: TimingPlan, target_utc: datetime, send_utc: datetime,
+             api_host: str | None) -> None:
+    """Logs the chosen timing and where the numbers come from."""
+    log.info("Timing: %s (%s)", plan.mode, plan.source)
+    if plan.click:
+        log.info("  tap latency: %s", plan.click.describe())
+    if plan.net:
+        log.info("  network RTT to %s: %s (half of min compensated)", api_host,
+                 plan.net.describe())
+    log.info("  compensation %d ms, margin %d ms", plan.compensation_ms, plan.margin_ms)
+    log.info("  send at %s CST / %s local", fmt_time(send_utc, BEIJING_OFFSET),
+             fmt_time(send_utc))
+    log.info("  request reaches the server no earlier than %s CST",
+             fmt_time(plan.earliest_arrival(target_utc), BEIJING_OFFSET))
 
 
 # --------------------------------------------------------------------------- session
@@ -800,9 +1077,9 @@ def health_check(dev: Device) -> list[str]:
 def final_check(dev: Device, button_text: str, button: Button,
                 need_inject: bool) -> tuple[Button, str]:
     """
-    Last check before firing: device state, a fresh UI dump (the app may have restarted
-    or scrolled since the audit), and an in-app injection probe.
-    Returns the button to tap and the UI dump ('' if it failed).
+    Last check before firing: device state and a fresh UI dump (the app may have
+    restarted or scrolled since the audit). Injects no input - it runs in the last
+    minute before the target. Returns the button to tap and the UI dump ('' if it failed).
     Raises DeviceError if tapping is certain to fail.
     """
     problems = health_check(dev)
@@ -824,29 +1101,91 @@ def final_check(dev: Device, button_text: str, button: Button,
     if (fresh.x, fresh.y) != (button.x, button.y):
         log.warning("Final check: the button moved from (%d, %d) to (%d, %d).",
                     button.x, button.y, fresh.x, fresh.y)
-
-    probe = probe_input_injection(dev, find_probe_target(xml, fresh))
-    if probe.denied:
-        msg = f"input injection is denied: {probe.error()}"
-        if need_inject:
-            raise DeviceError("device not ready for clicking: " + msg)
-        log.error("Final check: %s", msg)
-    else:
-        log.info("Final check passed: button at (%d, %d), %s probe ok (%.0f ms).",
-                 fresh.x, fresh.y, "in-app" if probe.targeted else "off-screen",
-                 probe.latency_ms)
+    log.info("Final check passed: button at (%d, %d).", fresh.x, fresh.y)
     return fresh, xml
 
 
-def wait_until(target_utc: datetime, clock: Clock, dev: Device) -> None:
-    """Sleeps until target, with periodic device health checks and a precise final spin."""
+@dataclass
+class Session:
+    """What the steps after the audit share."""
+    dev: Device
+    clock: Clock
+    args: argparse.Namespace
+    target_utc: datetime            # quota reset (00:00:00 CST or the test target)
+    measure: bool                   # measure the latency in the probe window
+
+
+def probe_phase(ses: Session, button: Button) -> Measurement | None:
+    """
+    In-app probes in the T-120..T-60 s window: taps on static text of the Mi Community
+    window (never the button), then logcat is scanned for a silent denial. With
+    measure=True they are timed (--probes of them) and the API host is pinged.
+    Raises DeviceError if the device rejects them and a real tap will follow.
+    """
+    dev, args, measure = ses.dev, ses.args, ses.measure
+    try:
+        xml = dump_ui(dev, attempts=2)
+        target = find_probe_target(
+            xml, find_button(xml, args.button_text, BUTTON_RESOURCE_ID) or button)
+    except (DeviceError, ET.ParseError) as exc:
+        log.warning("Probe: UI dump failed (%s) - no in-app probe.", exc)
+        return None
+    if target is None:
+        log.warning("Probe: no static text to tap in the Mi Community window.")
+        return None
+
+    deadline = ses.target_utc - timedelta(seconds=PROBE_END_SEC + PROBE_SAFETY_SEC)
+    samples, denial = measure_click_latency(dev, target, ses.clock, deadline,
+                                            args.probes if measure else 1)
+    if denial:
+        msg = f"input injection is denied: {denial}"
+        if not args.dry_run:
+            raise DeviceError("device not ready for clicking: " + msg)
+        log.error("Probe: %s", msg)
+        return None
+    if not measure:
+        if samples:
+            log.info("Probe: in-app tap on static text accepted (%.0f ms).", samples[0])
+        else:
+            log.warning("Probe inconclusive: the in-app tap failed.")
+        return None
+
+    needed = max(3, args.probes // 2)
+    if len(samples) < needed:
+        log.warning("Latency measurement inconclusive: %d/%d probes succeeded (need %d).",
+                    len(samples), args.probes, needed)
+        return None
+    tap = LatencyStats(samples)
+    log.info("Tap latency measured: %s", tap.describe())
+    return Measurement(tap, _probe_network(ses, deadline) if args.api_host else None)
+
+
+def _probe_network(ses: Session, deadline: datetime) -> LatencyStats | None:
+    """Pings --api-host from the phone until the deadline; None if not possible."""
+    host = ses.args.api_host
+    budget = (deadline - ses.clock.now()).total_seconds()
+    rtts = measure_network_rtt(ses.dev, host, ses.args.probes, budget) if budget >= 2 else []
+    if not rtts:
+        log.warning("ping %s from the phone is not available - the network delay "
+                    + "is not compensated.", host)
+        return None
+    net = LatencyStats(rtts)
+    log.info("Network RTT to %s measured: %s", host, net.describe())
+    return net
+
+
+def wait_until(target_utc: datetime, clock: Clock, dev: Device, quiet: bool = False) -> None:
+    """
+    Sleeps until target, with periodic device health checks and a precise final spin.
+    quiet=True: no health checks and no NTP resync (used in the last minute).
+    """
     remaining = (target_utc - clock.now()).total_seconds()
     log.info("Waiting %s until %s UTC.", timedelta(seconds=int(remaining)),
              target_utc.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
 
     # one more NTP sync before firing: the PC clock may drift or get adjusted by the OS
     # during a wait of several hours; skipped for short waits (the startup sync is fresh)
-    resync_pending = clock.synced and remaining > NTP_RESYNC_SEC + 30
+    resync_pending = not quiet and clock.synced and remaining > NTP_RESYNC_SEC + 30
     next_heartbeat = time.monotonic() + HEARTBEAT_SEC
     while True:
         remaining = (target_utc - clock.now()).total_seconds()
@@ -858,7 +1197,7 @@ def wait_until(target_utc: datetime, clock: Clock, dev: Device) -> None:
             clock.sync()
             continue
 
-        if time.monotonic() >= next_heartbeat and remaining > 5:
+        if not quiet and time.monotonic() >= next_heartbeat and remaining > 5:
             next_heartbeat = time.monotonic() + HEARTBEAT_SEC
             for p in health_check(dev):
                 log.log(logging.ERROR if p == INJECT_OFF else logging.WARNING,
@@ -950,19 +1289,49 @@ def build_parser() -> argparse.ArgumentParser:
         description="Automate the Mi Community unlock request at 00:00 Beijing time via ADB.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
-               "  automate.py --dry-run --test-in 5   check setup, rehearse in 5 s, no taps\n"
-               "  automate.py --test-in 30 --clicks 1 real tap in 30 s (sends a request!)\n"
+               "  automate.py --dry-run --test-in 90  check setup, rehearse in 90 s, no real tap\n"
+               "  automate.py --dry-run --test-in 150 same, including the latency measurement\n"
+               "  automate.py --test-in 30            real tap in 30 s (sends a request!)\n"
                "  automate.py                         real run at 00:00 CST\n")
-    p.add_argument("--clicks", type=int, default=2, help="number of taps (default: 2)")
-    p.add_argument("--delay", type=float, default=2.0,
-                   help="delay between taps in seconds (default: 2.0)")
-    p.add_argument("--lead-ms", type=int, default=DEFAULT_LEAD_MS,
-                   help=f"fire this many ms before the target (default: {DEFAULT_LEAD_MS})")
+    p.add_argument("--clicks", type=int, default=1, help="number of taps (default: 1)")
+    p.add_argument("--delay", type=float, default=DEFAULT_CLICK_DELAY_SEC,
+                   help="seconds between taps if --clicks > 1, at least "
+                        f"{MIN_CLICK_DELAY_SEC:g}: the server accepts one request per minute "
+                        f"(default: {DEFAULT_CLICK_DELAY_SEC:g})")
+    p.add_argument("--lead-ms", type=int, help=argparse.SUPPRESS)    # deprecated, ignored
     p.add_argument("--serial", help="device serial if several devices are connected")
     p.add_argument("--button-text", default=BUTTON_TEXT,
                    help=f"button label to look for (default: '{BUTTON_TEXT}')")
     p.add_argument("--ntp-server", default=NTP_SERVER, help=f"default: {NTP_SERVER}")
     p.add_argument("--no-ntp", action="store_true", help="use the local clock only")
+
+    t = p.add_argument_group(
+        "timing", "send = 00:00:00 CST + margin - measured delays (never earlier than "
+                  + f"00:00:00 + {MIN_ARRIVAL_MS} ms on the server)")
+    t.add_argument("--timing", choices=("adaptive", "fixed"), default="adaptive",
+                   help="adaptive: compensate the measured tap latency (and the network "
+                        "delay with --api-host); fixed: no compensation (default: adaptive)")
+    t.add_argument("--margin-ms", type=int, default=DEFAULT_MARGIN_MS,
+                   help="margin of fixed timing and of the fallback without a latency "
+                        f"estimate (default: {DEFAULT_MARGIN_MS})")
+    t.add_argument("--adaptive-margin-ms", type=int, default=DEFAULT_ADAPTIVE_MARGIN_MS,
+                   help=f"margin of adaptive timing (default: {DEFAULT_ADAPTIVE_MARGIN_MS}; "
+                        f"{WIDE_SPREAD_MARGIN_MS} if the latency varies a lot)")
+    t.add_argument("--probes", type=int, default=DEFAULT_PROBES,
+                   help="latency probes: taps on static text, never the button, between "
+                        f"T-120 s and T-60 s (default: {DEFAULT_PROBES})")
+    t.add_argument("--api-host", metavar="HOST",
+                   help="also ping HOST from the phone and compensate half of the minimal "
+                        "RTT (default: off, the network delay is not compensated)")
+
+    t.add_argument("--cache-file", metavar="FILE", default=DEFAULT_CACHE_FILE,
+                   help="where the last latency measurement is saved; used when no fresh "
+                        "one is possible (default: miunlock_latency.json next to the script)")
+    t.add_argument("--cache-max-age-days", type=float, metavar="DAYS",
+                   default=DEFAULT_CACHE_MAX_AGE_DAYS,
+                   help=f"ignore older measurements (default: {DEFAULT_CACHE_MAX_AGE_DAYS:g})")
+    t.add_argument("--no-cache", action="store_true",
+                   help="neither read nor write the latency cache")
 
     g = p.add_argument_group("testing")
     g.add_argument("--dry-run", action="store_true",
@@ -986,10 +1355,19 @@ def validate_args(p: argparse.ArgumentParser, args) -> None:
     """Validates argument combinations; exits via p.error() on bad input."""
     if args.clicks < 1:
         p.error("--clicks must be >= 1")
-    if args.delay < 0:
-        p.error("--delay must be >= 0")
-    if not 0 <= args.lead_ms <= 5000:
-        p.error("--lead-ms must be between 0 and 5000")
+    if args.clicks > 1 and args.delay < MIN_CLICK_DELAY_SEC:
+        p.error(f"--delay must be at least {MIN_CLICK_DELAY_SEC:g} s with --clicks > 1: "
+                "the server accepts one unlock request per minute, a faster repeat is "
+                "wasted and may hit the dialog opened by the first tap")
+    if args.margin_ms < 0 or args.adaptive_margin_ms < 0:
+        p.error("--margin-ms and --adaptive-margin-ms must be >= 0: sending before 00:00 "
+                "makes the request count for the previous day")
+    if args.cache_max_age_days <= 0:
+        p.error("--cache-max-age-days must be > 0")
+    if not 3 <= args.probes <= 100:
+        p.error("--probes must be between 3 and 100")
+    if args.api_host is not None and not _HOST_RE.fullmatch(args.api_host):
+        p.error("--api-host must be a host name or an IP address")
     if args.test_in is not None:
         if args.test_in < 5:
             p.error("--test-in must be at least 5 seconds")
@@ -1021,7 +1399,7 @@ def setup_logging(verbose: bool, log_file: str | None) -> None:
 
 
 def compute_target(args, clock: Clock) -> tuple[datetime, str]:
-    """Target moment in UTC and a human-readable description of it."""
+    """Target moment (quota reset, before any margin) in UTC and a description of it."""
     now = clock.now()
     if args.test_in is not None:
         return now + timedelta(seconds=args.test_in), f"test: now + {args.test_in:g} s"
@@ -1029,9 +1407,7 @@ def compute_target(args, clock: Clock) -> tuple[datetime, str]:
         tz = timedelta(hours=args.test_timezone)
         target = next_occurrence(args.test_time, now, tz)
         return target, f"test: {args.test_time} @ UTC{args.test_timezone:+g}"
-    midnight = next_occurrence("00:00:00", now, BEIJING_OFFSET)
-    return midnight - timedelta(milliseconds=args.lead_ms), \
-        f"live: 00:00:00 CST minus {args.lead_ms} ms"
+    return next_occurrence("00:00:00", now, BEIJING_OFFSET), "live: 00:00:00 CST"
 
 
 def run(args) -> int:
@@ -1040,12 +1416,19 @@ def run(args) -> int:
     if args.test:
         mode += " + TEST TIME"
     log.info("Mode: %s", mode)
+    if args.lead_ms is not None:
+        log.warning("--lead-ms is deprecated and ignored: sending before 00:00 makes the "
+                    "request count for the previous day; use --timing / --margin-ms.")
 
     dev = connect_device(args.serial)
     log.info("Connected to %s", dev.serial)
     clock = Clock(args.ntp_server, use_ntp=not args.no_ntp)
 
-    report = run_audit(dev, clock, args)
+    target_utc, label = compute_target(args, clock)
+    remaining = (target_utc - clock.now()).total_seconds()
+    can_probe = remaining > PROBE_END_SEC + PROBE_MIN_SEC     # no in-app taps after T-60 s
+    measure = args.timing == "adaptive" and remaining >= PROBE_START_SEC
+    report = run_audit(dev, clock, args, allow_probe=can_probe)
     report.print()
 
     if report.failed:
@@ -1060,32 +1443,79 @@ def run(args) -> int:
         log.error("Input injection is not confirmed working - refusing to wait for nothing.")
         return EXIT_AUDIT
 
-    target_utc, label = compute_target(args, clock)
     cst = target_utc.astimezone(timezone(BEIJING_OFFSET))
     log.info("Target (%s): %s CST / %s local", label,
              cst.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
              target_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
 
+    if args.timing == "adaptive" and not measure:
+        log.warning("Started less than %d s before the target - no latency measurement.",
+                    PROBE_START_SEC)
+
     with ScreenKeeper(dev, report.can_write_settings):
-        check_at = target_utc - timedelta(seconds=FINAL_CHECK_SEC)
-        if check_at > clock.now():
-            wait_until(check_at, clock, dev)
-        button, xml_before = final_check(dev, args.button_text, report.button,
-                                         need_inject=not args.dry_run)
-        since = device_time(dev)    # logcat window for the post-tap denial check
-        wait_until(target_utc, clock, dev)
-        done = click(dev, button, clock, args)
-        if not args.dry_run and done:
-            log.info("Keeping the screen on for 5 s while the request loads...")
-            time.sleep(5)
-            if not verify_after_tap(dev, button, args.button_text, xml_before, since):
-                done = 0
-        if done == args.clicks:
-            log.info("[SUCCESS] %d/%d taps %s.", done, args.clicks,
-                     "simulated" if args.dry_run else "injected")
-        else:
-            log.error("[FAILED] only %d/%d taps were injected.", done, args.clicks)
+        done = fire(Session(dev, clock, args, target_utc, measure), report.button)
     return EXIT_OK if done == args.clicks else EXIT_ERROR
+
+
+def latency_estimate(ses: Session, measured: Measurement | None
+                     ) -> tuple[LatencyStats | None, LatencyStats | None, str]:
+    """
+    Fresh measurement (saved to the cache), else a valid cached one, else nothing.
+    Returns tap latency, network RTT and where they come from.
+    """
+    args = ses.args
+    if args.timing != "adaptive":
+        return None, None, ""
+    path = None if args.no_cache else args.cache_file
+    if measured:
+        if path:
+            save_cache(path, ses.dev.serial, measured, args.api_host, ses.clock.now())
+        return measured.click, measured.net, "measured"
+    cached = (load_cache(path, ses.dev.serial, args.cache_max_age_days, ses.clock.now())
+              if path else None)
+    if cached is None:
+        return None, None, ""          # plan_timing warns about the standard margin
+    stamp = cached.measured_at.astimezone().strftime("%Y-%m-%d %H:%M")
+    log.warning("Latency measurement not possible - using the one saved on %s.", stamp)
+    net = cached.net if args.api_host and cached.api_host == args.api_host else None
+    if args.api_host and net is None:
+        log.warning("No saved ping to %s - the network delay is not compensated.",
+                    args.api_host)
+    return cached.tap, net, f"cache from {stamp}"
+
+
+def fire(ses: Session, button: Button) -> int:
+    """Probes, timing, final check, tap, verification. Returns the number of taps done."""
+    dev, clock, args, target_utc = ses.dev, ses.clock, ses.args, ses.target_utc
+    measured = None
+    if (target_utc - clock.now()).total_seconds() > PROBE_END_SEC + PROBE_MIN_SEC:
+        probe_at = target_utc - timedelta(seconds=PROBE_START_SEC)
+        if probe_at > clock.now():
+            wait_until(probe_at, clock, dev)
+        measured = probe_phase(ses, button)
+    plan = plan_timing(args, *latency_estimate(ses, measured))
+    plan, send_utc = checked_send_time(plan, target_utc)
+    log_plan(plan, target_utc, send_utc, args.api_host)
+
+    check_at = target_utc - timedelta(seconds=FINAL_CHECK_SEC)
+    if check_at > clock.now():
+        wait_until(check_at, clock, dev, quiet=True)
+    button, xml_before = final_check(dev, args.button_text, button,
+                                     need_inject=not args.dry_run)
+    since = device_time(dev)    # logcat window for the post-tap denial check
+    wait_until(send_utc, clock, dev, quiet=True)
+    done = click(dev, button, clock, args)
+    if not args.dry_run and done:
+        log.info("Keeping the screen on for 5 s while the request loads...")
+        time.sleep(5)
+        if not verify_after_tap(dev, button, args.button_text, xml_before, since):
+            done = 0
+    if done == args.clicks:
+        log.info("[SUCCESS] %d/%d taps %s.", done, args.clicks,
+                 "simulated" if args.dry_run else "injected")
+    else:
+        log.error("[FAILED] only %d/%d taps were injected.", done, args.clicks)
+    return done
 
 
 def main() -> int:
