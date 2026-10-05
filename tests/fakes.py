@@ -229,6 +229,52 @@ def ms(n):
     return timedelta(milliseconds=n)
 
 
+def proven_delay_ms(plan, measured):
+    """Send -> arrival delay the measurement proves (0 unless the plan compensates)."""
+    if plan.mode != "adaptive":
+        return 0.0
+    return measured.inject.min + (measured.net.min / 2 if measured.net else 0.0)
+
+
+def assert_timing_invariants(plan, send, target, measured, args):
+    proven = proven_delay_ms(plan, measured)
+    # no false start: even the fastest measured delivery arrives after target + 50 ms
+    assert send + timedelta(milliseconds=proven) >= target + ms(a.MIN_ARRIVAL_MS)
+    # the compensation is whole ms, never more than proven, wasting less than 1 ms
+    assert isinstance(plan.compensation_ms, int)
+    assert 0 <= plan.compensation_ms <= proven
+    if plan.mode == "adaptive":
+        assert proven - plan.compensation_ms < 1
+        # the device part of a tap fits into its round-trip minus the way there and back
+        adb = measured.adb_rtt.min / 2 if measured.adb_rtt else 0.0
+        assert measured.inject.min <= measured.round_trip.min - adb
+    else:
+        assert plan.compensation_ms == 0
+    # send time and the bound it promises agree with the plan
+    assert send == plan.send_time(target) == target + ms(plan.margin_ms - plan.compensation_ms)
+    assert plan.earliest_arrival(target) == target + ms(plan.margin_ms)
+    assert send >= target - ms(plan.compensation_ms)
+    assert plan.margin_ms >= a.MIN_ARRIVAL_MS
+    assert_margin_rule(plan, measured, args)
+
+
+def assert_margin_rule(plan, measured, args):
+    if plan.source == "guard fallback":
+        assert (plan.mode, plan.margin_ms) == ("fixed", a.DEFAULT_MARGIN_MS)
+    elif plan.mode == "fixed":
+        assert plan.margin_ms == args.margin_ms
+    else:
+        wide = measured.inject.p95 - measured.inject.min > a.WIDE_SPREAD_MS
+        expected = max(args.adaptive_margin_ms, a.WIDE_SPREAD_MARGIN_MS if wide else 0)
+        assert plan.margin_ms == expected
+
+
+def planned(argv, measured, target=T0):
+    args = a.build_parser().parse_args(argv)
+    plan, send = a.checked_send_time(a.plan_timing(args, measured, "test"), target)
+    return args, plan, send
+
+
 # --------------------------------------------------------------------------- cache
 
 def write_cache(path, serial="fake123", connection="usb", age=timedelta(hours=1),
