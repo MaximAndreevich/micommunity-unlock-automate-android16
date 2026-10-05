@@ -14,12 +14,23 @@ import automate as a  # noqa: E402
 
 UI_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
 <hierarchy rotation="0">
-  <node text="" resource-id="" bounds="[0,0][1080,2400]" enabled="true">
-    <node text="Unlock bootloader" resource-id="" bounds="[40,120][600,200]" enabled="true"/>
+  <node text="" resource-id="" package="com.android.systemui" clickable="false"
+        bounds="[0,0][1080,80]" enabled="true">
+    <node text="20:07" package="com.android.systemui" clickable="false"
+          bounds="[40,10][200,70]" enabled="true"/>
+  </node>
+  <node text="" resource-id="" package="com.mi.global.bbs" clickable="false"
+        bounds="[0,80][1080,2400]" enabled="true">
+    <node text="Back" package="com.mi.global.bbs" clickable="true"
+          bounds="[0,100][100,200]" enabled="true"/>
+    <node text="Unlock bootloader" resource-id="" package="com.mi.global.bbs"
+          clickable="false" bounds="[140,120][600,200]" enabled="true"/>
     <node text="Apply for unlocking" resource-id="com.mi.global.bbs:id/btnApply"
+          package="com.mi.global.bbs" clickable="true"
           bounds="[100,2000][980,2140]" enabled="true"/>
   </node>
 </hierarchy>"""
+BUTTON_BOUNDS = (100, 2000, 980, 2140)
 
 SECURITY_EXC = (
     "Exception occurred while executing 'tap':\n"
@@ -27,6 +38,9 @@ SECURITY_EXC = (
     "source of the instrumentation, if any) to have the INJECT_EVENTS permission.\n"
     "\tat com.android.server.input.InputManagerService.injectInputEventToTarget"
 )
+LOGCAT_DENIAL = ("10-05 20:07:03.687  1500  1600 W InputDispatcher: Permission denied: "
+                 "injecting event from pid 9825 uid 2000 to window Window{e1 u0 "
+                 "com.mi.global.bbs/.Unlock}")
 SETTINGS_EXC = ("Exception occurred while executing 'put':\njava.lang.SecurityException: "
                 "Permission denial: writing to settings requires:android.permission."
                 "WRITE_SECURE_SETTINGS")
@@ -34,12 +48,15 @@ SETTINGS_EXC = ("Exception occurred while executing 'put':\njava.lang.SecurityEx
 
 class FakeDevice(a.Device):
     def __init__(self, inject=True, settings=True, focus="com.mi.global.bbs", xml=UI_XML,
-                 adbinput=None, brand="Xiaomi"):
+                 adbinput=None, brand="Xiaomi", silent_denial=False):
         self.serial = "fake123"
         self.inject, self.settings, self.focus, self.xml = inject, settings, focus, xml
         # Xiaomi toggle; follows `inject` unless set explicitly ("" = property missing)
         self.adbinput = ("1" if inject else "0") if adbinput is None else adbinput
         self.brand = brand
+        self.silent_denial = silent_denial   # taps exit 0, denial only shows in logcat
+        self.logcat = ""
+        self.probe_taps = []                 # taps outside the unlock button
         self.store = {"global/stay_on_while_plugged_in": "0",
                       "system/screen_off_timeout": "30000"}
         self.taps = []
@@ -60,7 +77,18 @@ class FakeDevice(a.Device):
             if not self.inject:
                 out, rc = SECURITY_EXC.replace("'tap'", f"'{cmd.split()[1]}'"), 255
             elif cmd.startswith("input tap") and "-500" not in cmd:
-                self.taps.append(cmd)
+                x, y = map(int, cmd.split()[2:4])
+                x1, y1, x2, y2 = BUTTON_BOUNDS
+                if self.silent_denial:
+                    self.logcat += LOGCAT_DENIAL + "\n"
+                elif x1 <= x <= x2 and y1 <= y <= y2:
+                    self.taps.append(cmd)
+                else:
+                    self.probe_taps.append(cmd)
+        elif cmd.startswith("date"):
+            out = "10-05 20:07:03.000"
+        elif cmd.startswith("logcat"):
+            out, self.logcat = self.logcat, ""
         elif cmd.startswith("settings get"):
             _, _, ns, key = cmd.split()
             out = self.store.get(f"{ns}/{key}", "null")
@@ -138,6 +166,25 @@ def test_find_button_skips_zero_size_node():
     assert (b.x, b.y, b.matched_by) == (540, 2070, "text")
 
 
+def test_probe_target_is_static_text_in_app():
+    t = a.find_probe_target(UI_XML, a.find_button(UI_XML, "Apply for unlocking", "x"))
+    assert (t.x, t.y) == (370, 160)      # "Unlock bootloader", not systemui / Back
+
+
+def test_probe_target_skips_children_of_clickable_nodes():
+    xml = UI_XML.replace('package="com.mi.global.bbs" clickable="false"\n        bounds="[0,80]',
+                         'package="com.mi.global.bbs" clickable="true"\n        bounds="[0,80]')
+    assert a.find_probe_target(xml, None) is None
+
+
+def test_probe_target_avoids_the_button():
+    xml = UI_XML.replace('text="Unlock bootloader"', 'text=""')
+    xml = xml.replace('clickable="true"\n          bounds="[100,2000]',
+                      'clickable="false"\n          bounds="[100,2000]')
+    button = a.find_button(xml, "Apply for unlocking", "x")
+    assert a.find_probe_target(xml, button) is None
+
+
 def test_find_button_quotes_in_text_do_not_break():
     assert a.find_button(UI_XML, "it's", "x") is None
 
@@ -176,6 +223,21 @@ def test_audit_fails_when_adbinput_off_but_probe_passes(monkeypatch, caplog):
 
 def test_missing_adbinput_on_other_brand_does_not_fail(monkeypatch):
     assert run_with(monkeypatch, FakeDevice(adbinput="", brand="Google"), DRY) == a.EXIT_OK
+
+
+def test_audit_probes_inside_the_app_window(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    dev = FakeDevice()
+    assert run_with(monkeypatch, dev, DRY) == a.EXIT_OK
+    assert dev.probe_taps == ["input tap 370 160"]
+    assert "in Mi Community accepted" in caplog.text
+
+
+def test_audit_fails_on_silent_denial_in_logcat(monkeypatch, caplog):
+    dev = FakeDevice(silent_denial=True, adbinput="")
+    assert run_with(monkeypatch, dev, ["--test-in", "5"]) == a.EXIT_AUDIT
+    assert "Permission denied: injecting" in caplog.text
+    assert not dev.taps
 
 
 def test_live_refuses_without_inject(monkeypatch):

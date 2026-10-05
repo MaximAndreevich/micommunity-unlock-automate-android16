@@ -71,6 +71,12 @@ EXIT_OK, EXIT_ERROR, EXIT_AUDIT, EXIT_INTERRUPTED = 0, 1, 2, 130
 _EXCEPTION_RE = re.compile(r"(Exception|Error)( occurred|:)|Permission denial", re.IGNORECASE)
 _SECURITY_RE = re.compile(
     r"SecurityException|INJECT_EVENTS|WRITE_SECURE_SETTINGS|Permission denial")
+# Some builds drop a rejected injection silently and only log it. Note that HyperOS logs
+# every injection as "MIUIInput: Input ... event injection from package" - not a denial.
+_LOGCAT_DENIED_RE = re.compile(
+    r"INJECT_EVENTS|Permission denied: injecting|injection (was )?(denied|failed|rejected)",
+    re.IGNORECASE)
+_DEVICE_TIME_RE = re.compile(r"\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}")
 
 INJECT_HINT = """\
 The shell user is not allowed to inject input (INJECT_EVENTS).
@@ -352,6 +358,42 @@ def find_button(xml_text: str, button_text: str, resource_id: str) -> Button | N
     return None
 
 
+def _blocks_tap(node: ET.Element) -> bool:
+    """True if tapping inside the node can trigger something."""
+    return (any(node.get(attr) == "true"
+                for attr in ("clickable", "long-clickable", "checkable"))
+            or "EditText" in (node.get("class") or ""))
+
+
+def _contains(bounds: str, x: int, y: int) -> bool:
+    m = _BOUNDS_RE.fullmatch(bounds)
+    if not m:
+        return False
+    x1, y1, x2, y2 = map(int, m.groups())
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def find_probe_target(xml_text: str, avoid: Button | None) -> Button | None:
+    """
+    Static text in the Mi Community window that a tap cannot activate: neither the node
+    nor any of its ancestors is clickable, and it lies outside the unlock button.
+    A tap there goes through the same window-owner permission check as the real tap.
+    """
+    def walk(node: ET.Element, blocked: bool) -> Button | None:
+        blocked = blocked or _blocks_tap(node)
+        if (not blocked and node.get("package") == APP_PACKAGE
+                and (node.get("text") or "").strip()):
+            target = _button_from_node(node, "probe")
+            if target and not (avoid and _contains(avoid.bounds, target.x, target.y)):
+                return target
+        for child in node:
+            found = walk(child, blocked)
+            if found:
+                return found
+        return None
+    return walk(ET.fromstring(xml_text), False)
+
+
 def dump_ui(dev: Device, attempts: int = 3) -> str:
     """uiautomator dump with retries (it fails while animations are running)."""
     last_err = ""
@@ -418,6 +460,7 @@ class AuditReport:
     can_write_settings: bool = False
     can_inject: bool = False
     xiaomi: bool = False
+    probe_target: Button | None = None
 
     def add(self, name: str, status: Status, detail: str = "", hint: str = "") -> Check:
         """Appends a check and returns it."""
@@ -450,18 +493,71 @@ class AuditReport:
         log.log(logging.ERROR if self.failed else logging.INFO, "Audit %s.", verdict)
 
 
-def probe_input_injection(dev: Device) -> ShellResult:
+@dataclass
+class InjectProbe:
+    """Outcome of an input injection probe."""
+    result: ShellResult
+    targeted: bool                 # True = tapped into the Mi Community window
+    latency_ms: float = 0.0        # round-trip of the input command itself
+    logcat_denial: str = ""        # logcat line reporting a rejected injection
+
+    @property
+    def ok(self) -> bool:
+        """True if the event was accepted."""
+        return self.result.ok and not self.logcat_denial
+
+    @property
+    def denied(self) -> bool:
+        """True if the device reported a missing permission."""
+        return self.result.security_denied or bool(self.logcat_denial)
+
+    def error(self) -> str:
+        """Most relevant error line for logging."""
+        return self.logcat_denial or self.result.first_line_of_error()
+
+
+def device_time(dev: Device) -> str:
+    """Device clock in logcat -T format ('' if unknown)."""
+    out = dev.run("date '+%m-%d %H:%M:%S.000'", timeout=10).output.strip()
+    return out if _DEVICE_TIME_RE.fullmatch(out) else ""
+
+
+def logcat_denial(dev: Device, since: str) -> str:
+    """First logcat line since `since` that reports a rejected injection ('' if none)."""
+    if not since:
+        return ""
+    out = dev.run(f"logcat -d -T '{since}'", timeout=20).output
+    for line in out.splitlines():
+        if _LOGCAT_DENIED_RE.search(line):
+            return line.strip()[:200]
+    return ""
+
+
+def timed_run(dev: Device, cmd: str) -> tuple[ShellResult, float]:
+    """Runs cmd, returns the result and its round-trip in ms."""
+    t0 = time.perf_counter()
+    res = dev.run(cmd, timeout=15)
+    return res, (time.perf_counter() - t0) * 1000
+
+
+def probe_input_injection(dev: Device, target: Button | None) -> InjectProbe:
     """
-    Harmless input injection probe. A KEYCODE_UNKNOWN (0) key event goes through the
-    same INJECT_EVENTS permission check as a tap but does nothing. If a build rejects
-    keycode 0 for another reason, fall back to a tap far outside the screen, which is
-    also permission-checked first and then dropped (no window there).
+    Input injection probe. With a target (static text in the Mi Community window) the
+    tap is checked exactly like the real one, then logcat is scanned for a silent denial.
+    Without a target, fall back to KEYCODE_UNKNOWN / an off-screen tap: those reach no
+    window, so on HyperOS they pass even when real taps are denied - not a proof.
     """
-    res = dev.run("input keyevent 0", timeout=15)
-    if res.ok or res.security_denied:
-        return res
-    log.debug("keyevent probe inconclusive (%s), trying off-screen tap", res.first_line_of_error())
-    return dev.run("input tap -500 -500", timeout=15)
+    if target is not None:
+        since = device_time(dev)
+        res, latency = timed_run(dev, f"input tap {target.x} {target.y}")
+        time.sleep(0.3)    # let InputDispatcher deliver (and log) the event
+        return InjectProbe(res, True, latency, logcat_denial(dev, since))
+    res, latency = timed_run(dev, "input keyevent 0")
+    if not (res.ok or res.security_denied):
+        log.debug("keyevent probe inconclusive (%s), trying off-screen tap",
+                  res.first_line_of_error())
+        res, latency = timed_run(dev, "input tap -500 -500")
+    return InjectProbe(res, False, latency)
 
 
 def probe_settings_write(dev: Device) -> tuple[bool, str]:
@@ -498,17 +594,23 @@ def _audit_device_info(dev: Device, rep: AuditReport) -> None:
 
 
 def _audit_permissions(dev: Device, rep: AuditReport) -> None:
-    probe = probe_input_injection(dev)
+    name = "Input injection (INJECT_EVENTS)"
+    probe = probe_input_injection(dev, rep.probe_target)
     rep.can_inject = probe.ok
-    if probe.ok:
-        rep.add("Input injection (INJECT_EVENTS)", Status.OK, "input events can be injected")
-    elif probe.security_denied:
-        rep.add("Input injection (INJECT_EVENTS)", Status.FAIL,
-                probe.first_line_of_error(), INJECT_HINT)
-    else:
-        rep.add("Input injection (INJECT_EVENTS)", Status.WARN,
-                f"probe inconclusive: {probe.first_line_of_error()}",
+    if probe.denied:
+        rep.add(name, Status.FAIL, probe.error(), INJECT_HINT)
+    elif not probe.ok:
+        rep.add(name, Status.WARN, f"probe inconclusive: {probe.error()}",
                 "Run 'adb shell input tap 1 1' manually to check.")
+    elif probe.targeted:
+        t = rep.probe_target
+        rep.add(name, Status.OK,
+                f"tap on static text at ({t.x}, {t.y}) in Mi Community accepted")
+    else:
+        rep.add(name, Status.WARN, "only an off-screen probe passed",
+                "No static text to tap was found in the Mi Community window, so it is\n"
+                + "not proven that taps reach the app. Check --save-dump.")
+    rep.add("Input tap round-trip", Status.INFO, f"{probe.latency_ms:.0f} ms")
 
     # On Xiaomi this property is the "USB debugging (Security settings)" toggle itself.
     # The probe above cannot be trusted on its own: events that reach no app window
@@ -578,6 +680,7 @@ def _audit_button(dev: Device, rep: AuditReport, button_text: str,
                 + "pass the button label with --button-text, or check --save-dump.")
         return
     rep.button = button
+    rep.probe_target = find_probe_target(xml, button)
     if button.enabled:
         rep.add("Unlock button", Status.OK,
                 f"({button.x}, {button.y}) bounds {button.bounds}, "
@@ -621,9 +724,10 @@ def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
         return rep
     rep.add("ADB shell", Status.OK, "responds")
 
-    _audit_permissions(dev, rep)
+    # the UI dump comes first: the injection probe taps static text found in it
     _audit_screen(dev, rep)
     _audit_button(dev, rep, args.button_text, args.save_dump)
+    _audit_permissions(dev, rep)
     _audit_clock(clock, rep, args.no_ntp)
     _audit_latency(dev, rep)
     return rep
@@ -679,8 +783,8 @@ def health_check(dev: Device, full: bool) -> list[str]:
     if pkg and pkg != APP_PACKAGE:
         problems.append(f"Mi Community is not in foreground (focused: {pkg})")
     if full:
-        probe = probe_input_injection(dev)
-        if probe.security_denied:
+        probe = probe_input_injection(dev, None)
+        if probe.denied:
             problems.append("input injection is denied again "
                             "('USB debugging (Security settings)' was reset)")
     return problems
