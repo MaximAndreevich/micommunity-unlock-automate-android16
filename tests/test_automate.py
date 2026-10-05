@@ -83,9 +83,23 @@ class FakeDevice(a.Device):
         return a.ShellResult(cmd, rc, out)
 
 
+def use_virtual_time(monkeypatch):
+    """time.sleep() advances a virtual time.time(); every time() call costs 1 ms."""
+    now = [1_800_000_000.0]
+
+    def fake_time():
+        now[0] += 0.001
+        return now[0]
+
+    def fake_sleep(sec):
+        now[0] += sec
+    monkeypatch.setattr(a.time, "time", fake_time)
+    monkeypatch.setattr(a.time, "sleep", fake_sleep)
+
+
 def run_with(monkeypatch, dev, argv):
     monkeypatch.setattr(a, "connect_device", lambda serial: dev)
-    monkeypatch.setattr(a.time, "sleep", lambda s: None)
+    use_virtual_time(monkeypatch)
     args = a.build_parser().parse_args(argv + ["--no-ntp"])
     a.validate_args(a.build_parser(), args)
     return a.run(args)
