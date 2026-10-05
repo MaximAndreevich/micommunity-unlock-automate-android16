@@ -298,34 +298,54 @@ class Button:
 _BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
 
+def _node_labels(node: ET.Element) -> tuple[str, str]:
+    return node.get("text") or "", node.get("content-desc") or ""
+
+
+def _match_exact(node: ET.Element, button_text: str, _resource_id: str) -> bool:
+    return button_text in _node_labels(node)
+
+
+def _match_substring(node: ET.Element, button_text: str, _resource_id: str) -> bool:
+    wanted = button_text.casefold()
+    return any(wanted in label.casefold() for label in _node_labels(node))
+
+
+def _match_resource_id(node: ET.Element, _button_text: str, resource_id: str) -> bool:
+    return node.get("resource-id") == resource_id
+
+
+# tried in this order; the label ends up in Button.matched_by
+_BUTTON_MATCHERS = (
+    ("text", _match_exact),
+    ("text~", _match_substring),
+    ("resource-id", _match_resource_id),
+)
+
+
+def _button_from_node(node: ET.Element, matched_by: str) -> Button | None:
+    """Button at the centre of the node, None if it has no visible bounds."""
+    bounds = node.get("bounds") or ""
+    m = _BOUNDS_RE.fullmatch(bounds)
+    if not m:
+        return None
+    x1, y1, x2, y2 = map(int, m.groups())
+    if x2 <= x1 or y2 <= y1:
+        return None    # invisible / zero-size node
+    return Button((x1 + x2) // 2, (y1 + y2) // 2, bounds,
+                  node.get("enabled", "true") == "true", matched_by)
+
+
 def find_button(xml_text: str, button_text: str, resource_id: str) -> Button | None:
     """Finds the button by exact text, then case-insensitive substring, then resource-id."""
-    root = ET.fromstring(xml_text)
-    nodes = list(root.iter("node"))
-    wanted = button_text.casefold()
-
-    def by_exact(n):
-        return n.get("text") == button_text or n.get("content-desc") == button_text
-
-    def by_substring(n):
-        return wanted in (n.get("text") or "").casefold() or \
-            wanted in (n.get("content-desc") or "").casefold()
-
-    def by_id(n):
-        return n.get("resource-id") == resource_id
-
-    for label, pred in (("text", by_exact), ("text~", by_substring), ("resource-id", by_id)):
+    nodes = list(ET.fromstring(xml_text).iter("node"))
+    for label, matches in _BUTTON_MATCHERS:
         for node in nodes:
-            if not pred(node):
+            if not matches(node, button_text, resource_id):
                 continue
-            m = _BOUNDS_RE.fullmatch(node.get("bounds") or "")
-            if not m:
-                continue
-            x1, y1, x2, y2 = map(int, m.groups())
-            if x2 <= x1 or y2 <= y1:
-                continue    # invisible / zero-size node
-            return Button((x1 + x2) // 2, (y1 + y2) // 2, node.get("bounds"),
-                          node.get("enabled", "true") == "true", label)
+            button = _button_from_node(node, label)
+            if button is not None:
+                return button
     return None
 
 

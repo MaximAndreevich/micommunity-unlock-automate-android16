@@ -102,6 +102,20 @@ def test_find_button_fallback_to_resource_id():
     assert b.matched_by == "resource-id"
 
 
+def test_find_button_substring_in_content_desc():
+    xml = UI_XML.replace('text="Apply for unlocking"',
+                         'text="" content-desc="Tap to apply for unlocking now"')
+    b = a.find_button(xml, "Apply for unlocking", "x")
+    assert (b.x, b.y, b.matched_by) == (540, 2070, "text~")
+
+
+def test_find_button_skips_zero_size_node():
+    hidden = '<node text="Apply for unlocking" bounds="[0,0][0,0]" enabled="true"/>'
+    xml = UI_XML.replace('<node text="Unlock bootloader"', hidden + '\n<node text="Unlock bootloader"')
+    b = a.find_button(xml, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+    assert (b.x, b.y, b.matched_by) == (540, 2070, "text")
+
+
 def test_find_button_quotes_in_text_do_not_break():
     assert a.find_button(UI_XML, "it's", "x") is None
 
