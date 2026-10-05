@@ -1,6 +1,7 @@
 """Shared fakes for the offline tests: a simulated HyperOS phone over ADB, virtual
 time, timing and cache helpers."""
 
+import itertools
 import json
 import math
 import re
@@ -63,7 +64,10 @@ class FakeDevice(a.Device):
         self.taps = []
         self.commands = []
         self.ping_output = ""                # "" = ping not available
-        self.inject_ms = inject_ms           # command start -> injection (device clock)
+        # command start -> injection (device clock); a list is cycled through (jitter)
+        self.delays = itertools.cycle(inject_ms if isinstance(inject_ms, (list, tuple))
+                                      else [inject_ms])
+        self.injections = []                 # (command, moment the event was injected)
         self.tap_rt_ms = tap_rt_ms           # round-trip of a tap command
         self.inject_log = inject_log         # HyperOS logs every injection (MIUIInput)
 
@@ -140,8 +144,11 @@ class FakeDevice(a.Device):
         """tap_command(): prints the start time, logs the injection like HyperOS."""
         start = a.time.time()
         res = self.run(cmd, timeout)
+        injected = start + next(self.delays) / 1000
+        if res.returncode == 0 and not self.silent_denial:
+            self.injections.append((cmd, injected))
         if res.returncode == 0 and self.inject_log and not self.silent_denial:
-            logged = math.floor((start + self.inject_ms / 1000) * 1000) / 1000   # truncated
+            logged = math.floor(injected * 1000) / 1000   # truncated
             self.logcat += (f"{logged:.3f}  2678 13244 W MIUIInput: Input motion event "
                             "injection from package: null action ACTION_DOWN\n")
         a.time.sleep(self.tap_rt_ms / 1000)

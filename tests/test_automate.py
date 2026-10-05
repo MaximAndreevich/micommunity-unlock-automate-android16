@@ -14,7 +14,6 @@ from fakes import (DRY, LOGCAT_DENIAL, SECURITY_EXC, T0, UI_XML, VIRTUAL_START,
 
 
 
-
 def test_find_button_by_text():
     b = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
     assert (b.x, b.y, b.matched_by) == (540, 2070, "text")
