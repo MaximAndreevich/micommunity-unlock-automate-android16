@@ -33,9 +33,13 @@ SETTINGS_EXC = ("Exception occurred while executing 'put':\njava.lang.SecurityEx
 
 
 class FakeDevice(a.Device):
-    def __init__(self, inject=True, settings=True, focus="com.mi.global.bbs", xml=UI_XML):
+    def __init__(self, inject=True, settings=True, focus="com.mi.global.bbs", xml=UI_XML,
+                 adbinput=None, brand="Xiaomi"):
         self.serial = "fake123"
         self.inject, self.settings, self.focus, self.xml = inject, settings, focus, xml
+        # Xiaomi toggle; follows `inject` unless set explicitly ("" = property missing)
+        self.adbinput = ("1" if inject else "0") if adbinput is None else adbinput
+        self.brand = brand
         self.store = {"global/stay_on_while_plugged_in": "0",
                       "system/screen_off_timeout": "30000"}
         self.taps = []
@@ -48,9 +52,9 @@ class FakeDevice(a.Device):
             out = "ok"
         elif cmd.startswith("getprop"):
             out = {"ro.build.version.sdk": "36", "ro.build.version.release": "16",
-                   "ro.product.manufacturer": "Xiaomi", "ro.product.model": "23090RA98G",
+                   "ro.product.manufacturer": self.brand, "ro.product.model": "23090RA98G",
                    "ro.mi.os.version.name": "OS3.0", "ro.product.mod_device": "garnet_global",
-                   "persist.security.adbinput": "1" if self.inject else "0"
+                   "persist.security.adbinput": self.adbinput,
                    }.get(cmd.split()[1], "")
         elif cmd.startswith("input"):
             if not self.inject:
@@ -160,6 +164,18 @@ def test_audit_fails_without_inject_events(monkeypatch, caplog):
     assert run_with(monkeypatch, dev, DRY) == a.EXIT_AUDIT
     assert "USB debugging (Security settings)" in caplog.text
     assert not dev.taps
+
+
+def test_audit_fails_when_adbinput_off_but_probe_passes(monkeypatch, caplog):
+    # HyperOS 3: off-screen probes succeed even with the toggle off, real taps do not
+    dev = FakeDevice(inject=True, adbinput="0")
+    assert run_with(monkeypatch, dev, ["--test-in", "5"]) == a.EXIT_AUDIT
+    assert "Security settings OFF" in caplog.text
+    assert not dev.taps
+
+
+def test_missing_adbinput_on_other_brand_does_not_fail(monkeypatch):
+    assert run_with(monkeypatch, FakeDevice(adbinput="", brand="Google"), DRY) == a.EXIT_OK
 
 
 def test_live_refuses_without_inject(monkeypatch):

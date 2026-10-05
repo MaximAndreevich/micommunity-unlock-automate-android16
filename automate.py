@@ -59,6 +59,8 @@ STAY_ON_KEY = "stay_on_while_plugged_in"
 STAY_ON_ALL = "7"                # AC | USB | wireless
 SCREEN_TIMEOUT_MAX = "2147483647"
 
+ADBINPUT_PROP = "persist.security.adbinput"   # Xiaomi: "USB debugging (Security settings)"
+
 HEARTBEAT_SEC = 60.0             # how often to re-check the device while waiting
 FINAL_CHECK_SEC = 20.0           # last full check this many seconds before firing
 NTP_RESYNC_SEC = 60.0            # re-query NTP this many seconds before firing
@@ -415,6 +417,7 @@ class AuditReport:
     button: Button | None = None
     can_write_settings: bool = False
     can_inject: bool = False
+    xiaomi: bool = False
 
     def add(self, name: str, status: Status, detail: str = "", hint: str = "") -> Check:
         """Appends a check and returns it."""
@@ -482,7 +485,8 @@ def _audit_device_info(dev: Device, rep: AuditReport) -> None:
             f"{brand} {model} ({dev.serial}), Android {release} / SDK {sdk}"
             + (f", HyperOS/MIUI {hyperos}" if hyperos else ""))
 
-    if brand and brand.lower() not in {"xiaomi", "redmi", "poco"}:
+    rep.xiaomi = brand.lower() in {"xiaomi", "redmi", "poco"}
+    if brand and not rep.xiaomi:
         rep.add("Manufacturer", Status.WARN, f"'{brand}' is not Xiaomi",
                 "Mi Community bootloader unlock only applies to Xiaomi devices.")
 
@@ -506,10 +510,16 @@ def _audit_permissions(dev: Device, rep: AuditReport) -> None:
                 f"probe inconclusive: {probe.first_line_of_error()}",
                 "Run 'adb shell input tap 1 1' manually to check.")
 
-    adbinput = dev.getprop("persist.security.adbinput")
-    if adbinput:
+    # On Xiaomi this property is the "USB debugging (Security settings)" toggle itself.
+    # The probe above cannot be trusted on its own: events that reach no app window
+    # pass even with the toggle off.
+    adbinput = dev.getprop(ADBINPUT_PROP)
+    if adbinput == "0" and rep.xiaomi:
+        rep.can_inject = False
+        rep.add(ADBINPUT_PROP, Status.FAIL, "0 (Security settings OFF)", INJECT_HINT)
+    elif adbinput:
         state = "ON" if adbinput == "1" else "OFF"
-        rep.add("persist.security.adbinput", Status.INFO,
+        rep.add(ADBINPUT_PROP, Status.OK if adbinput == "1" else Status.INFO,
                 f"{adbinput} (Security settings {state})")
 
     ok, err = probe_settings_write(dev)
