@@ -486,9 +486,14 @@ def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
     pkg = foreground_package(dev)
     if pkg == APP_PACKAGE:
         rep.add("Mi Community in foreground", Status.OK, pkg)
+    elif not pkg:
+        # dumpsys output format differs between builds - do not block the run on it
+        rep.add("Mi Community in foreground", Status.WARN,
+                "could not detect the focused app",
+                "Make sure Mi Community -> Me -> Unlock bootloader is on screen.")
     else:
         rep.add("Mi Community in foreground", Status.FAIL,
-                f"focused app is '{pkg or 'unknown (lock screen?)'}'",
+                f"focused app is '{pkg}'",
                 "Open Mi Community -> Me -> Unlock bootloader and leave it on screen.")
 
     # --- button
