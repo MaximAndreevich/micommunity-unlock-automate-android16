@@ -99,8 +99,14 @@ Only **measured** delays are compensated, by their **minimum**; anything unmeasu
   not work, the network is not compensated). Margin `--adaptive-margin-ms` (50) covers NTP
   error, network asymmetry and taps faster than the measured minimum; if the latency varies
   a lot (p95 - min > 100 ms) the margin becomes 150 ms (WARN).
-- Started later than T-120 s, or the probes failed: no measurement, WARN, and the standard
-  150 ms margin is used (fixed timing).
+- Started later than T-120 s, or the probes failed / were inconclusive: no fresh measurement.
+  Then the last saved measurement is used (WARN `using the one saved on <date>`), or, without
+  one, the standard 150 ms margin (WARN, fixed timing).
+- Every successful measurement is saved to `miunlock_latency.json` next to the script
+  (`--cache-file`): serial, connection type (usb / tcp), time, all samples, min/median/p95.
+  It is only used for the same serial and connection type and if it is not older than
+  `--cache-max-age-days` (7). A broken file is ignored with a warning. `--no-cache` turns
+  reading and writing off.
 - Guard: if the computed plan would let the request arrive before 00:00:00.050 CST, it is
   treated as a calculation error (ERROR) and fixed timing with 150 ms is used.
 
@@ -128,7 +134,8 @@ usage: automate.py [-h] [--clicks CLICKS] [--delay DELAY] [--serial SERIAL]
                    [--button-text BUTTON_TEXT] [--ntp-server NTP_SERVER] [--no-ntp]
                    [--timing {adaptive,fixed}] [--margin-ms MARGIN_MS]
                    [--adaptive-margin-ms ADAPTIVE_MARGIN_MS] [--probes PROBES]
-                   [--api-host HOST] [--dry-run]
+                   [--api-host HOST] [--cache-file FILE]
+                   [--cache-max-age-days DAYS] [--no-cache] [--dry-run]
                    [--force] [--test] [--test-time TEST_TIME]
                    [--test-timezone TEST_TIMEZONE] [--test-in SEC]
                    [--save-dump FILE] [--log-file FILE] [-v]
@@ -146,6 +153,9 @@ timing:
   --adaptive-margin-ms MS    adaptive margin (default: 50; 150 if the latency varies a lot)
   --probes N            latency probes between T-120 s and T-60 s (default: 20)
   --api-host HOST       ping HOST from the phone, compensate half of the min RTT (default: off)
+  --cache-file FILE     latency cache (default: miunlock_latency.json next to the script)
+  --cache-max-age-days DAYS  ignore older measurements (default: 7)
+  --no-cache            neither read nor write the latency cache
   --lead-ms             deprecated, ignored with a warning
 
 testing:

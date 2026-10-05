@@ -31,8 +31,10 @@ from __future__ import annotations
 # pylint: disable=too-many-lines
 
 import argparse
+import json
 import logging
 import math
+import os
 import re
 import statistics
 import sys
@@ -40,6 +42,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import ntplib
@@ -64,6 +67,8 @@ WIDE_SPREAD_MARGIN_MS = 150      # ... and gets this margin
 MIN_ARRIVAL_MS = 50              # guard: the request may never arrive before target + this
 DEFAULT_PROBES = 20              # latency probes (taps on static text, never the button)
 PROBE_GAP_SEC = 0.1
+DEFAULT_CACHE_FILE = str(Path(__file__).resolve().with_name("miunlock_latency.json"))
+DEFAULT_CACHE_MAX_AGE_DAYS = 7.0
 NTP_SERVER = "pool.ntp.org"
 NTP_SAMPLES = 4
 
@@ -847,6 +852,86 @@ def measure_network_rtt(dev: Device, host: str, count: int, budget_sec: float) -
     return samples
 
 
+def connection_type(serial: str) -> str:
+    """'tcp' for adb over the network (host:port or an mDNS service name), else 'usb'."""
+    return "tcp" if re.fullmatch(r".+:\d+", serial) or "._tcp" in serial else "usb"
+
+
+@dataclass
+class CachedLatency:
+    """A measurement saved by an earlier run."""
+    measured_at: datetime
+    tap: LatencyStats
+    net: LatencyStats | None
+    api_host: str | None
+
+
+def _stats_to_json(stats: LatencyStats) -> dict:
+    return {"samples_ms": [round(x, 2) for x in stats.samples],
+            "min_ms": round(stats.min, 2), "median_ms": round(stats.median, 2),
+            "p95_ms": round(stats.p95, 2)}
+
+
+def _stats_from_json(obj: dict) -> LatencyStats:
+    samples = [float(x) for x in obj["samples_ms"]]
+    if not samples or not all(math.isfinite(x) and x >= 0 for x in samples):
+        raise ValueError("bad samples_ms")
+    return LatencyStats(samples)
+
+
+def save_cache(path: str, serial: str, measured: Measurement, api_host: str | None,
+               now: datetime) -> None:
+    """Saves a successful measurement (never fails the run)."""
+    data = {"serial": serial, "connection": connection_type(serial),
+            "measured_at": now.isoformat(), "tap": _stats_to_json(measured.click),
+            "net": _stats_to_json(measured.net) if measured.net else None,
+            "api_host": api_host if measured.net else None}
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("Could not save the latency cache %s: %s", path, exc)
+        return
+    log.info("Latency measurement saved to %s.", path)
+
+
+def load_cache(path: str, serial: str, max_age_days: float,
+               now: datetime) -> CachedLatency | None:
+    """
+    The saved measurement if it is for this device and connection type and not too old.
+    A broken file is ignored with a warning.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        log.debug("No latency cache at %s.", path)
+        return None
+    except (OSError, ValueError) as exc:
+        log.warning("Latency cache %s is unreadable (%s) - ignored.", path, exc)
+        return None
+    try:
+        cached = CachedLatency(
+            datetime.fromisoformat(data["measured_at"]), _stats_from_json(data["tap"]),
+            _stats_from_json(data["net"]) if data.get("net") else None, data.get("api_host"))
+        age = now - cached.measured_at      # TypeError if measured_at has no time zone
+        same_device = (data["serial"], data["connection"]) == (serial, connection_type(serial))
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        log.warning("Latency cache %s is broken (%s) - ignored.", path, exc)
+        return None
+    if not same_device:
+        log.info("Latency cache %s is for %s over %s - not used.", path, data["serial"],
+                 data["connection"])
+        return None
+    if not timedelta(hours=-1) <= age <= timedelta(days=max_age_days):
+        log.info("Latency cache %s is from %s, not within %g days - not used.", path,
+                 cached.measured_at.isoformat(timespec="seconds"), max_age_days)
+        return None
+    return cached
+
+
 @dataclass
 class TimingPlan:
     """When to send the tap: target + margin - compensation."""
@@ -1239,6 +1324,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also ping HOST from the phone and compensate half of the minimal "
                         "RTT (default: off, the network delay is not compensated)")
 
+    t.add_argument("--cache-file", metavar="FILE", default=DEFAULT_CACHE_FILE,
+                   help="where the last latency measurement is saved; used when no fresh "
+                        "one is possible (default: miunlock_latency.json next to the script)")
+    t.add_argument("--cache-max-age-days", type=float, metavar="DAYS",
+                   default=DEFAULT_CACHE_MAX_AGE_DAYS,
+                   help=f"ignore older measurements (default: {DEFAULT_CACHE_MAX_AGE_DAYS:g})")
+    t.add_argument("--no-cache", action="store_true",
+                   help="neither read nor write the latency cache")
+
     g = p.add_argument_group("testing")
     g.add_argument("--dry-run", action="store_true",
                    help="do everything (audit, screen-on, wait) but do not tap")
@@ -1268,6 +1362,8 @@ def validate_args(p: argparse.ArgumentParser, args) -> None:
     if args.margin_ms < 0 or args.adaptive_margin_ms < 0:
         p.error("--margin-ms and --adaptive-margin-ms must be >= 0: sending before 00:00 "
                 "makes the request count for the previous day")
+    if args.cache_max_age_days <= 0:
+        p.error("--cache-max-age-days must be > 0")
     if not 3 <= args.probes <= 100:
         p.error("--probes must be between 3 and 100")
     if args.api_host is not None and not _HOST_RE.fullmatch(args.api_host):
@@ -1361,6 +1457,33 @@ def run(args) -> int:
     return EXIT_OK if done == args.clicks else EXIT_ERROR
 
 
+def latency_estimate(ses: Session, measured: Measurement | None
+                     ) -> tuple[LatencyStats | None, LatencyStats | None, str]:
+    """
+    Fresh measurement (saved to the cache), else a valid cached one, else nothing.
+    Returns tap latency, network RTT and where they come from.
+    """
+    args = ses.args
+    if args.timing != "adaptive":
+        return None, None, ""
+    path = None if args.no_cache else args.cache_file
+    if measured:
+        if path:
+            save_cache(path, ses.dev.serial, measured, args.api_host, ses.clock.now())
+        return measured.click, measured.net, "measured"
+    cached = (load_cache(path, ses.dev.serial, args.cache_max_age_days, ses.clock.now())
+              if path else None)
+    if cached is None:
+        return None, None, ""          # plan_timing warns about the standard margin
+    stamp = cached.measured_at.astimezone().strftime("%Y-%m-%d %H:%M")
+    log.warning("Latency measurement not possible - using the one saved on %s.", stamp)
+    net = cached.net if args.api_host and cached.api_host == args.api_host else None
+    if args.api_host and net is None:
+        log.warning("No saved ping to %s - the network delay is not compensated.",
+                    args.api_host)
+    return cached.tap, net, f"cache from {stamp}"
+
+
 def fire(ses: Session, button: Button) -> int:
     """Probes, timing, final check, tap, verification. Returns the number of taps done."""
     dev, clock, args, target_utc = ses.dev, ses.clock, ses.args, ses.target_utc
@@ -1370,8 +1493,7 @@ def fire(ses: Session, button: Button) -> int:
         if probe_at > clock.now():
             wait_until(probe_at, clock, dev)
         measured = probe_phase(ses, button)
-    plan = plan_timing(args, measured.click if measured else None,
-                       measured.net if measured else None, "measured")
+    plan = plan_timing(args, *latency_estimate(ses, measured))
     plan, send_utc = checked_send_time(plan, target_utc)
     log_plan(plan, target_utc, send_utc, args.api_host)
 

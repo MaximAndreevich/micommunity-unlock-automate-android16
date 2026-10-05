@@ -3,6 +3,7 @@
 Run: python -m pytest -q tests
 """
 
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -43,6 +44,14 @@ LOGCAT_DENIAL = ("10-05 20:07:03.687  1500  1600 W InputDispatcher: Permission d
 SETTINGS_EXC = ("Exception occurred while executing 'put':\njava.lang.SecurityException: "
                 "Permission denial: writing to settings requires:android.permission."
                 "WRITE_SECURE_SETTINGS")
+
+
+@pytest.fixture(autouse=True)
+def cache_file(tmp_path, monkeypatch):
+    """Keeps tests away from the real latency cache next to the script."""
+    path = tmp_path / "latency.json"
+    monkeypatch.setattr(a, "DEFAULT_CACHE_FILE", str(path))
+    return path
 
 
 class FakeDevice(a.Device):
@@ -117,9 +126,12 @@ class FakeDevice(a.Device):
         return a.ShellResult(cmd, rc, out)
 
 
+VIRTUAL_START = 1_800_000_000.0
+
+
 def use_virtual_time(monkeypatch):
     """time.sleep() advances a virtual time.time(); every time() call costs 1 ms."""
-    now = [1_800_000_000.0]
+    now = [VIRTUAL_START]
 
     def fake_time():
         now[0] += 0.001
@@ -581,4 +593,93 @@ def test_failed_probes_are_inconclusive(monkeypatch, caplog):
     dev.run = run
     assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
     assert "Latency measurement inconclusive" in caplog.text
+    assert "using the standard margin of 150 ms" in caplog.text
+
+
+# --------------------------------------------------------------------------- cache
+
+def write_cache(path, serial="fake123", connection="usb", age=timedelta(hours=1),
+                samples=(120, 125, 140), now=None):
+    now = now or datetime.fromtimestamp(VIRTUAL_START, timezone.utc)
+    path.write_text(json.dumps({
+        "serial": serial, "connection": connection,
+        "measured_at": (now - age).isoformat(),
+        "tap": {"samples_ms": list(samples)}, "net": None, "api_host": None}))
+
+
+def test_measurement_is_saved(monkeypatch, cache_file):
+    assert run_with(monkeypatch, FakeDevice(), ["--dry-run", "--test-in", "150"]) == a.EXIT_OK
+    data = json.loads(cache_file.read_text())
+    assert (data["serial"], data["connection"]) == ("fake123", "usb")
+    assert len(data["tap"]["samples_ms"]) == 20
+    assert {"min_ms", "median_ms", "p95_ms"} <= data["tap"].keys()
+    assert datetime.fromisoformat(data["measured_at"]).tzinfo is not None
+
+
+def test_late_start_without_cache_uses_standard_margin(monkeypatch, caplog, cache_file):
+    caplog.set_level("INFO")
+    assert run_with(monkeypatch, FakeDevice(), ["--dry-run", "--test-in", "30"]) == a.EXIT_OK
+    assert "Latency estimate impossible - using the standard margin of 150 ms" \
+        in caplog.text
+    assert "compensation 0 ms, margin 150 ms" in caplog.text
+    assert not cache_file.exists()
+
+
+def test_late_start_uses_cache(monkeypatch, caplog, cache_file):
+    caplog.set_level("INFO")
+    write_cache(cache_file)
+    dev = FakeDevice()
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "30"]) == a.EXIT_OK
+    assert "Latency measurement not possible - using the one saved on" in caplog.text
+    assert "compensation 120 ms, margin 50 ms" in caplog.text
+    assert dev.probe_taps == []
+
+
+def test_no_cache_flag(monkeypatch, caplog, cache_file):
+    write_cache(cache_file)
+    before = cache_file.read_text()
+    assert run_with(monkeypatch, FakeDevice(),
+                    ["--dry-run", "--test-in", "30", "--no-cache"]) == a.EXIT_OK
+    assert "using the standard margin of 150 ms" in caplog.text
+    assert run_with(monkeypatch, FakeDevice(),
+                    ["--dry-run", "--test-in", "150", "--no-cache"]) == a.EXIT_OK
+    assert cache_file.read_text() == before
+
+
+def test_cache_used_only_for_the_same_device_and_fresh(cache_file):
+    now = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
+    write_cache(cache_file, now=now, age=timedelta(days=6, hours=23))
+    assert a.load_cache(str(cache_file), "fake123", 7, now).tap.min == 120
+    for kwargs in ({"serial": "other"}, {"connection": "tcp"},
+                   {"age": timedelta(days=7, minutes=1)}, {"age": -timedelta(days=1)}):
+        write_cache(cache_file, now=now, **kwargs)
+        assert a.load_cache(str(cache_file), "fake123", 7, now) is None, kwargs
+
+
+def test_tcp_cache_matches_tcp_serial(cache_file):
+    now = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
+    write_cache(cache_file, serial="192.168.1.5:5555", connection="tcp", now=now)
+    assert a.load_cache(str(cache_file), "192.168.1.5:5555", 7, now) is not None
+    assert a.connection_type("adb-abc._adb-tls-connect._tcp") == "tcp"
+    assert a.connection_type("a1b2c3d4") == "usb"
+
+
+@pytest.mark.parametrize("content", ["{not json", "[]", '{"serial": "fake123"}',
+                                     '{"serial": "fake123", "connection": "usb", '
+                                     '"measured_at": "2026-10-06T10:00:00", '
+                                     '"tap": {"samples_ms": [100]}}',
+                                     '{"serial": "fake123", "connection": "usb", '
+                                     '"measured_at": "2026-10-06T10:00:00+00:00", '
+                                     '"tap": {"samples_ms": []}}'])
+def test_broken_cache_is_ignored(cache_file, caplog, content):
+    cache_file.write_text(content)
+    now = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
+    assert a.load_cache(str(cache_file), "fake123", 7, now) is None
+    assert "ignored" in caplog.text
+
+
+def test_broken_cache_does_not_stop_the_run(monkeypatch, caplog, cache_file):
+    cache_file.write_text("{not json")
+    assert run_with(monkeypatch, FakeDevice(), ["--dry-run", "--test-in", "30"]) == a.EXIT_OK
+    assert "is unreadable" in caplog.text
     assert "using the standard margin of 150 ms" in caplog.text
