@@ -228,14 +228,39 @@ def test_missing_adbinput_on_other_brand_does_not_fail(monkeypatch):
 def test_audit_probes_inside_the_app_window(monkeypatch, caplog):
     caplog.set_level("INFO")
     dev = FakeDevice()
-    assert run_with(monkeypatch, dev, DRY) == a.EXIT_OK
-    assert dev.probe_taps == ["input tap 370 160"] * 2     # audit + final check
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "90"]) == a.EXIT_OK
+    assert dev.probe_taps == ["input tap 370 160"] * 2     # audit + T-90 s probe
     assert "in Mi Community accepted" in caplog.text
+
+
+def test_no_probe_in_the_last_minute(monkeypatch, caplog):
+    dev = FakeDevice()
+    assert run_with(monkeypatch, dev, DRY) == a.EXIT_OK
+    assert dev.probe_taps == []
+    assert "probe skipped: the target is less than a minute away" in caplog.text
+
+
+@pytest.mark.parametrize("test_in", ["90", "200", "3600"])
+def test_only_the_real_tap_in_the_last_minute(monkeypatch, test_in):
+    dev = FakeDevice()
+    inputs = []          # (virtual time, command)
+    real_run = dev.run
+
+    def run(cmd, timeout=30.0):
+        if cmd.startswith("input"):
+            inputs.append((a.time.time(), cmd))
+        return real_run(cmd, timeout)
+    dev.run = run
+    assert run_with(monkeypatch, dev, ["--test-in", test_in]) == a.EXIT_OK
+    (fired_at, tap), = [i for i in inputs if i[1] in dev.taps]
+    assert tap == "input tap 540 2070"
+    probes = [t for t, cmd in inputs if cmd != tap]
+    assert probes and all(fired_at - t > a.PROBE_END_SEC for t in probes)
 
 
 def test_audit_fails_on_silent_denial_in_logcat(monkeypatch, caplog):
     dev = FakeDevice(silent_denial=True, adbinput="")
-    assert run_with(monkeypatch, dev, ["--test-in", "5"]) == a.EXIT_AUDIT
+    assert run_with(monkeypatch, dev, ["--test-in", "90"]) == a.EXIT_AUDIT
     assert "Permission denied: injecting" in caplog.text
     assert not dev.taps
 
@@ -368,20 +393,28 @@ def test_final_check_stops_when_toggle_reset(monkeypatch):
         a.final_check(dev, "Apply for unlocking", button, need_inject=True)
 
 
-def test_final_check_stops_on_silent_denial(monkeypatch):
+def test_probe_phase_stops_on_silent_denial(monkeypatch):
     monkeypatch.setattr(a.time, "sleep", lambda s: None)
     dev = FakeDevice(silent_denial=True, adbinput="")
     button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
     with pytest.raises(a.DeviceError, match="Permission denied: injecting"):
-        a.final_check(dev, "Apply for unlocking", button, need_inject=True)
+        a.probe_phase(dev, "Apply for unlocking", button, need_inject=True)
+
+
+def test_final_check_injects_nothing(monkeypatch):
+    monkeypatch.setattr(a.time, "sleep", lambda s: None)
+    dev = FakeDevice()
+    button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+    a.final_check(dev, "Apply for unlocking", button, need_inject=True)
+    assert not [c for c in dev.commands if c.startswith("input")]
 
 
 def test_taps_where_the_button_is_at_fire_time(monkeypatch, caplog):
     dev = FakeDevice()
     real_audit = a.run_audit
 
-    def audit_then_scroll(*args):
-        report = real_audit(*args)
+    def audit_then_scroll(*args, **kwargs):
+        report = real_audit(*args, **kwargs)
         dev.xml = UI_XML.replace("[100,2000][980,2140]", "[100,1800][980,1940]")
         return report
     monkeypatch.setattr(a, "run_audit", audit_then_scroll)

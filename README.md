@@ -43,12 +43,12 @@ HyperOS 3 — only events delivered into another app's window are rejected. So t
 treats `adbinput=0` as a failure and probes by tapping static text inside the
 Mi Community window (a title, never the button).
 
-Toggle it OFF/ON, replug USB and run `python automate.py --dry-run --test-in 5`.
+Toggle it OFF/ON, replug USB and run `python automate.py --dry-run --test-in 90`.
 
 ## Set up
 1. Open the Mi community app, switch to global region in the app settings
 2. Navigate to "Me -> Unlock Bootloader" and keep the screen at the page
-3. Connect the device to the computer, run `python automate.py --dry-run --test-in 5`,
+3. Connect the device to the computer, run `python automate.py --dry-run --test-in 90`,
    fix anything marked `FAIL`
 4. Run the script.
 
@@ -61,8 +61,11 @@ What the script does:
 2. Keeps the screen on and saves the original values.
 3. Waits until 00:00:00 Beijing time minus `--lead-ms` (200 ms by default) using an NTP-corrected clock
    (NTP is queried once, not in a loop). Re-checks the device and the Security settings
-   toggle every minute. 30 s before firing it dumps the UI again, re-locates the button
-   (the app may have restarted or scrolled) and repeats the in-app probe.
+   toggle every minute. Between T-120 s and T-60 s it repeats the in-app probe tap.
+   **In the last minute no input is injected except the real tap**: the heartbeat stops,
+   and the final check at T-20 s only reads the device state and dumps the UI again to
+   re-locate the button (the app may have restarted or scrolled). If the script is started
+   less than a minute before the target, the audit skips the in-app probe (WARN).
 4. Taps the button once (`--clicks`) and verifies that each tap was really injected
    (Android prints the exception but still exits with code 0, so the old version reported success anyway).
    Logs how long each `input` command took: it starts a JVM on the phone, so the tap lands
@@ -121,9 +124,9 @@ testing:
 ```
 
 ## Examples
-1. Check that everything is ready: full rehearsal in 5 seconds without tapping
+1. Check that everything is ready: full rehearsal in 90 seconds without tapping the button
 ```shell
-python automate.py --dry-run --test-in 5
+python automate.py --dry-run --test-in 90
 ```
 
 2. Real tap test in 30 seconds (sends a real request!)

@@ -65,8 +65,13 @@ SCREEN_TIMEOUT_MAX = "2147483647"
 ADBINPUT_PROP = "persist.security.adbinput"   # Xiaomi: "USB debugging (Security settings)"
 
 HEARTBEAT_SEC = 60.0             # how often to re-check the device while waiting
-FINAL_CHECK_SEC = 30.0           # last full check (UI dump + probe) this long before firing
-NTP_RESYNC_SEC = 60.0            # re-query NTP this many seconds before firing
+NTP_RESYNC_SEC = 60.0            # re-query NTP this many seconds before a long wait ends
+# Schedule relative to the target T. Taps into the app (always on static text, never the
+# button) only happen before T-60 s; after that only checks without input and the real tap.
+PROBE_START_SEC = 120.0          # in-app probes / latency measurement start at T-120 s ...
+PROBE_END_SEC = 60.0             # ... and must be done by T-60 s
+PROBE_MIN_SEC = 5.0              # no probes if less than this is left before T-60 s
+FINAL_CHECK_SEC = 20.0           # last check (state + UI dump, no input) at T-20 s
 
 MIN_CLICK_DELAY_SEC = 60.0       # the server accepts one unlock request per minute
 DEFAULT_CLICK_DELAY_SEC = 61.0
@@ -96,7 +101,7 @@ Notes:
   * On HyperOS 2/3 (Android 15/16) it often resets after a reboot or an OTA, and some
     builds silently reset it after ~a few minutes if the Mi account check fails.
     Toggle it OFF and ON again, then unplug/replug USB and re-run with
-    --dry-run --test-in 5.
+    --dry-run --test-in 90.
   * Re-authorise the computer if prompted ("Revoke USB debugging authorisations" helps
     when the toggle seems ignored).
   * Other OEMs: look for "Disable permission monitoring" (ColorOS/realme/OnePlus)."""
@@ -599,8 +604,7 @@ def _audit_device_info(dev: Device, rep: AuditReport) -> None:
                           else "  <- China ROMs are not supported by this flow"))
 
 
-def _audit_permissions(dev: Device, rep: AuditReport) -> None:
-    name = "Input injection (INJECT_EVENTS)"
+def _audit_inject_probe(dev: Device, rep: AuditReport, name: str) -> None:
     probe = probe_input_injection(dev, rep.probe_target)
     rep.can_inject = probe.ok
     if probe.denied:
@@ -617,6 +621,17 @@ def _audit_permissions(dev: Device, rep: AuditReport) -> None:
                 "No static text to tap was found in the Mi Community window, so it is\n"
                 + "not proven that taps reach the app. Check --save-dump.")
     rep.add("Input tap round-trip", Status.INFO, f"{probe.latency_ms:.0f} ms")
+
+
+def _audit_permissions(dev: Device, rep: AuditReport, allow_probe: bool) -> None:
+    name = "Input injection (INJECT_EVENTS)"
+    if allow_probe:
+        _audit_inject_probe(dev, rep, name)
+    else:
+        rep.can_inject = True     # only persist.security.adbinput below can veto it
+        rep.add(name, Status.WARN, "probe skipped: the target is less than a minute away",
+                "No input is injected in the last minute before the target except the\n"
+                + "real tap. Start earlier (e.g. --test-in 90) to probe a tap into the app.")
 
     # On Xiaomi this property is the "USB debugging (Security settings)" toggle itself.
     # The probe above cannot be trusted on its own: events that reach no app window
@@ -720,8 +735,11 @@ def _audit_latency(dev: Device, rep: AuditReport) -> None:
         rep.add("ADB latency", Status.INFO, f"median {statistics.median(rtts) * 1000:.0f} ms")
 
 
-def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
-    """Runs all preflight checks without changing anything on the device."""
+def run_audit(dev: Device, clock: Clock, args, allow_probe: bool = True) -> AuditReport:
+    """
+    Runs all preflight checks without changing anything on the device.
+    allow_probe=False skips the in-app tap probe (the target is less than a minute away).
+    """
     rep = AuditReport()
     _audit_device_info(dev, rep)
 
@@ -733,7 +751,7 @@ def run_audit(dev: Device, clock: Clock, args) -> AuditReport:
     # the UI dump comes first: the injection probe taps static text found in it
     _audit_screen(dev, rep)
     _audit_button(dev, rep, args.button_text, args.save_dump)
-    _audit_permissions(dev, rep)
+    _audit_permissions(dev, rep, allow_probe)
     _audit_clock(clock, rep, args.no_ntp)
     _audit_latency(dev, rep)
     return rep
@@ -803,9 +821,9 @@ def health_check(dev: Device) -> list[str]:
 def final_check(dev: Device, button_text: str, button: Button,
                 need_inject: bool) -> tuple[Button, str]:
     """
-    Last check before firing: device state, a fresh UI dump (the app may have restarted
-    or scrolled since the audit), and an in-app injection probe.
-    Returns the button to tap and the UI dump ('' if it failed).
+    Last check before firing: device state and a fresh UI dump (the app may have
+    restarted or scrolled since the audit). Injects no input - it runs in the last
+    minute before the target. Returns the button to tap and the UI dump ('' if it failed).
     Raises DeviceError if tapping is certain to fail.
     """
     problems = health_check(dev)
@@ -827,29 +845,50 @@ def final_check(dev: Device, button_text: str, button: Button,
     if (fresh.x, fresh.y) != (button.x, button.y):
         log.warning("Final check: the button moved from (%d, %d) to (%d, %d).",
                     button.x, button.y, fresh.x, fresh.y)
+    log.info("Final check passed: button at (%d, %d).", fresh.x, fresh.y)
+    return fresh, xml
 
-    probe = probe_input_injection(dev, find_probe_target(xml, fresh))
+
+def probe_phase(dev: Device, button_text: str, button: Button, need_inject: bool) -> None:
+    """
+    In-app injection probe in the T-120..T-60 s window: a tap on static text of the
+    Mi Community window (never the button), then logcat is scanned for a silent denial.
+    Raises DeviceError if the device rejects it and a real tap will follow.
+    """
+    try:
+        xml = dump_ui(dev, attempts=2)
+        target = find_probe_target(xml, find_button(xml, button_text, BUTTON_RESOURCE_ID)
+                                   or button)
+    except (DeviceError, ET.ParseError) as exc:
+        log.warning("Probe: UI dump failed (%s) - no in-app probe.", exc)
+        return
+    if target is None:
+        log.warning("Probe: no static text to tap in the Mi Community window.")
+        return
+    probe = probe_input_injection(dev, target)
     if probe.denied:
         msg = f"input injection is denied: {probe.error()}"
         if need_inject:
             raise DeviceError("device not ready for clicking: " + msg)
-        log.error("Final check: %s", msg)
+        log.error("Probe: %s", msg)
+    elif probe.ok:
+        log.info("Probe: in-app tap on static text accepted (%.0f ms).", probe.latency_ms)
     else:
-        log.info("Final check passed: button at (%d, %d), %s probe ok (%.0f ms).",
-                 fresh.x, fresh.y, "in-app" if probe.targeted else "off-screen",
-                 probe.latency_ms)
-    return fresh, xml
+        log.warning("Probe inconclusive: %s", probe.error())
 
 
-def wait_until(target_utc: datetime, clock: Clock, dev: Device) -> None:
-    """Sleeps until target, with periodic device health checks and a precise final spin."""
+def wait_until(target_utc: datetime, clock: Clock, dev: Device, quiet: bool = False) -> None:
+    """
+    Sleeps until target, with periodic device health checks and a precise final spin.
+    quiet=True: no health checks and no NTP resync (used in the last minute).
+    """
     remaining = (target_utc - clock.now()).total_seconds()
     log.info("Waiting %s until %s UTC.", timedelta(seconds=int(remaining)),
              target_utc.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
 
     # one more NTP sync before firing: the PC clock may drift or get adjusted by the OS
     # during a wait of several hours; skipped for short waits (the startup sync is fresh)
-    resync_pending = clock.synced and remaining > NTP_RESYNC_SEC + 30
+    resync_pending = not quiet and clock.synced and remaining > NTP_RESYNC_SEC + 30
     next_heartbeat = time.monotonic() + HEARTBEAT_SEC
     while True:
         remaining = (target_utc - clock.now()).total_seconds()
@@ -861,7 +900,7 @@ def wait_until(target_utc: datetime, clock: Clock, dev: Device) -> None:
             clock.sync()
             continue
 
-        if time.monotonic() >= next_heartbeat and remaining > 5:
+        if not quiet and time.monotonic() >= next_heartbeat and remaining > 5:
             next_heartbeat = time.monotonic() + HEARTBEAT_SEC
             for p in health_check(dev):
                 log.log(logging.ERROR if p == INJECT_OFF else logging.WARNING,
@@ -953,7 +992,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Automate the Mi Community unlock request at 00:00 Beijing time via ADB.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
-               "  automate.py --dry-run --test-in 5   check setup, rehearse in 5 s, no taps\n"
+               "  automate.py --dry-run --test-in 90  check setup, rehearse in 90 s, no real tap\n"
                "  automate.py --test-in 30            real tap in 30 s (sends a request!)\n"
                "  automate.py                         real run at 00:00 CST\n")
     p.add_argument("--clicks", type=int, default=1, help="number of taps (default: 1)")
@@ -1052,7 +1091,10 @@ def run(args) -> int:
     log.info("Connected to %s", dev.serial)
     clock = Clock(args.ntp_server, use_ntp=not args.no_ntp)
 
-    report = run_audit(dev, clock, args)
+    target_utc, label = compute_target(args, clock)
+    # remaining time when the probes would start; less than this -> no in-app probes
+    can_probe = (target_utc - clock.now()).total_seconds() > PROBE_END_SEC + PROBE_MIN_SEC
+    report = run_audit(dev, clock, args, allow_probe=can_probe)
     report.print()
 
     if report.failed:
@@ -1067,20 +1109,24 @@ def run(args) -> int:
         log.error("Input injection is not confirmed working - refusing to wait for nothing.")
         return EXIT_AUDIT
 
-    target_utc, label = compute_target(args, clock)
     cst = target_utc.astimezone(timezone(BEIJING_OFFSET))
     log.info("Target (%s): %s CST / %s local", label,
              cst.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
              target_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
 
     with ScreenKeeper(dev, report.can_write_settings):
+        if (target_utc - clock.now()).total_seconds() > PROBE_END_SEC + PROBE_MIN_SEC:
+            probe_at = target_utc - timedelta(seconds=PROBE_START_SEC)
+            if probe_at > clock.now():
+                wait_until(probe_at, clock, dev)
+            probe_phase(dev, args.button_text, report.button, need_inject=not args.dry_run)
         check_at = target_utc - timedelta(seconds=FINAL_CHECK_SEC)
         if check_at > clock.now():
-            wait_until(check_at, clock, dev)
+            wait_until(check_at, clock, dev, quiet=True)
         button, xml_before = final_check(dev, args.button_text, report.button,
                                          need_inject=not args.dry_run)
         since = device_time(dev)    # logcat window for the post-tap denial check
-        wait_until(target_utc, clock, dev)
+        wait_until(target_utc, clock, dev, quiet=True)
         done = click(dev, button, clock, args)
         if not args.dry_run and done:
             log.info("Keeping the screen on for 5 s while the request loads...")
