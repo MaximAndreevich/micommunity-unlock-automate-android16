@@ -50,7 +50,8 @@ SETTINGS_EXC = ("Exception occurred while executing 'put':\njava.lang.SecurityEx
 class FakeDevice(a.Device):
     def __init__(self, inject=True, settings=True, focus="com.mi.global.bbs", xml=UI_XML,
                  adbinput=None, brand="Xiaomi", silent_denial=False, inject_ms=70.0,
-                 tap_rt_ms=120.0, inject_log=True, real_tap_inject_ms=None):
+                 tap_rt_ms=120.0, inject_log=True, real_tap_inject_ms=None,
+                 device_clock_offset=0.0):
         self.serial = "fake123"
         self.inject, self.settings, self.focus, self.xml = inject, settings, focus, xml
         # Xiaomi toggle; follows `inject` unless set explicitly ("" = property missing)
@@ -70,6 +71,7 @@ class FakeDevice(a.Device):
         self.injections = []                 # (command, moment the event was injected)
         self.real_tap_inject_ms = real_tap_inject_ms   # the button tap's own delay (None:
                                                        # the next one of inject_ms)
+        self.clock_offset = device_clock_offset        # phone clock - PC clock, s
         self.tap_rt_ms = tap_rt_ms           # round-trip of a tap command
         self.inject_log = inject_log         # HyperOS logs every injection (MIUIInput)
         self.broken = ()                     # command prefixes failing with an adb error
@@ -172,15 +174,16 @@ class FakeDevice(a.Device):
         hit_button = len(self.taps) > button_taps
         delay = (self.real_tap_inject_ms if hit_button and self.real_tap_inject_ms is not None
                  else next(self.delays))
-        injected = start + delay / 1000
+        injected = start + delay / 1000                # PC clock, for the tests
         if res.returncode == 0 and not self.silent_denial:
             self.injections.append((cmd, injected))
         if res.returncode == 0 and self.inject_log and not self.silent_denial:
-            logged = math.floor(injected * 1000) / 1000   # truncated
+            logged = math.floor((injected + self.clock_offset) * 1000) / 1000   # truncated
             self.logcat += (f"{logged:.3f}  2678 13244 W MIUIInput: Input motion event "
                             "injection from package: null action ACTION_DOWN\n")
         a.time.sleep(self.tap_rt_ms / 1000)
-        return a.ShellResult(cmd, res.returncode, f"miunlock_start={start:.6f}\n" + res.output)
+        return a.ShellResult(cmd, res.returncode,
+                             f"miunlock_start={start + self.clock_offset:.6f}\n" + res.output)
 
 
 VIRTUAL_START = 1_800_000_000.0

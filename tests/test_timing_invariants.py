@@ -73,7 +73,11 @@ def test_send_time_does_not_depend_on_the_target_time_zone():
 
 # ------------------------------------------------------------------- end to end
 # The fake phone injects every tap `inject_ms` after the command starts, in virtual
-# time; the real tap must land no earlier than target + margin.
+# time; the real tap must land no earlier than target + margin. The phone clock is off
+# by a few seconds (CLOCK_OFFSETS), so mixing it up with the PC clock shows up.
+
+CLOCK_OFFSETS = pytest.mark.parametrize("offset", [0.0, 3.7, -2.5],
+                                        ids=["same clock", "phone +3.7 s", "phone -2.5 s"])
 
 def real_run(monkeypatch, dev, argv):
     """A non-dry run; returns the plan, the target, the send moment and the injection."""
@@ -91,13 +95,14 @@ def real_run(monkeypatch, dev, argv):
     return plan, target, send, injected
 
 
+@CLOCK_OFFSETS
 @pytest.mark.parametrize("timing", [[], ["--timing", "fixed"]], ids=["adaptive", "fixed"])
 @pytest.mark.parametrize("inject_ms, tap_rt_ms", [(5, 60), (70, 120), (140, 250),
                                                   ([90, 70, 130, 75], 200)],
                          ids=["fast", "typical", "slow", "jitter"])
 def test_real_tap_is_injected_after_target_plus_margin(monkeypatch, inject_ms, tap_rt_ms,
-                                                       timing):
-    dev = FakeDevice(inject_ms=inject_ms, tap_rt_ms=tap_rt_ms)
+                                                       timing, offset):
+    dev = FakeDevice(inject_ms=inject_ms, tap_rt_ms=tap_rt_ms, device_clock_offset=offset)
     plan, target, send, injected = real_run(monkeypatch, dev, timing)
     assert plan.mode == ("fixed" if timing else "adaptive")
     assert injected >= target + ms(plan.margin_ms) >= target + ms(a.MIN_ARRIVAL_MS)
@@ -122,11 +127,13 @@ def reported_tap(caplog):
     return float(delay), int(after)
 
 
+@CLOCK_OFFSETS
 @pytest.mark.parametrize("real_ms", [53.04, 40, 20, 3.5])
 def test_real_tap_faster_than_the_probes_still_lands_after_the_target(monkeypatch, caplog,
-                                                                       real_ms):
+                                                                       real_ms, offset):
     caplog.set_level("INFO")
-    dev = FakeDevice(inject_ms=PROBES_MS, tap_rt_ms=130, real_tap_inject_ms=real_ms)
+    dev = FakeDevice(inject_ms=PROBES_MS, tap_rt_ms=130, real_tap_inject_ms=real_ms,
+                     device_clock_offset=offset)
     plan, target, _, injected = real_run(monkeypatch, dev, [])
     assert (plan.mode, plan.compensation_ms, plan.margin_ms) == ("adaptive", 53, 50)
     assert injected >= target

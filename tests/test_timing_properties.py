@@ -172,8 +172,9 @@ def test_measured_delay_is_a_lower_bound_of_the_real_one(run):
 @settings(max_examples=30, deadline=None,
           suppress_health_check=[HealthCheck.function_scoped_fixture])
 @given(inject=st.lists(st.floats(min_value=1, max_value=400), min_size=1, max_size=6),
-       slack=st.floats(min_value=5, max_value=300), fixed=st.booleans())
-def test_real_tap_never_lands_early(cache_file, inject, slack, fixed):
+       slack=st.floats(min_value=5, max_value=300), fixed=st.booleans(),
+       offset=st.floats(min_value=-30, max_value=30))
+def test_real_tap_never_lands_early(cache_file, inject, slack, fixed, offset):
     cache_file.unlink(missing_ok=True)                  # every run measures for itself
     plans = []
     with pytest.MonkeyPatch.context() as mp:
@@ -183,7 +184,8 @@ def test_real_tap_never_lands_early(cache_file, inject, slack, fixed):
             plans.append((plan, target_utc))
             return real_log_plan(plan, target_utc, send_utc, *rest)
         mp.setattr(a, "log_plan", spy)
-        dev = FakeDevice(inject_ms=inject, tap_rt_ms=max(inject) + slack)
+        dev = FakeDevice(inject_ms=inject, tap_rt_ms=max(inject) + slack,
+                         device_clock_offset=offset)                # phone clock - PC clock
         argv = ["--test-in", "150"] + (["--timing", "fixed"] if fixed else [])
         assert run_with(mp, dev, argv) == a.EXIT_OK
 
