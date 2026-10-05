@@ -194,3 +194,21 @@ def test_no_early_or_extra_tap_whenever_the_phone_breaks(monkeypatch, cache_file
             assert_safe(out)
         except AssertionError as exc:
             raise AssertionError(f"{fault} at T{moment:+d} s: {out}") from exc
+
+
+# ------------------------------------------------------------- known gap
+
+def test_window_opened_after_the_final_check_gets_the_tap(monkeypatch, caplog):
+    """Documents a gap, not a wish: nothing is checked between the final check (T-20 s)
+    and the tap, so a dialog that opens in between gets the tap at the button's
+    coordinates. The tap is accepted and reported as a success; only the screenshots
+    show what happened."""
+    caplog.set_level("INFO")
+    dev = FakeDevice()
+    dev.at(at_target(BEFORE_TAP), focus="com.miui.securitycenter")
+    out = simulate(monkeypatch, dev)
+    assert (out.code, len(out.injected)) == (a.EXIT_OK, 1)     # injected - into the dialog
+    assert dev.taps == []                                         # not on the button
+    assert dev.other_window_taps == [BUTTON_TAP]
+    assert "[SUCCESS] 1/1 taps injected" in caplog.text
+    assert "Screenshots after the tap" in caplog.text

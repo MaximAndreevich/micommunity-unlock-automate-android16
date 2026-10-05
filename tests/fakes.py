@@ -60,6 +60,7 @@ class FakeDevice(a.Device):
         self.silent_denial = silent_denial   # taps exit 0, denial only shows in logcat
         self.logcat = ""
         self.probe_taps = []                 # taps outside the unlock button
+        self.other_window_taps = []          # taps while another window had the focus
         self.store = {"global/stay_on_while_plugged_in": "0",
                       "system/screen_off_timeout": "30000"}
         self.taps = []
@@ -122,6 +123,8 @@ class FakeDevice(a.Device):
                 button = a.find_button(self.xml, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
                 if self.silent_denial:
                     self.logcat += LOGCAT_DENIAL + "\n"
+                elif self.focus != a.APP_PACKAGE:
+                    self.other_window_taps.append(cmd)
                 elif button and a._contains(button.bounds, x, y):
                     self.taps.append(cmd)
                 else:
