@@ -226,7 +226,9 @@ GitHub Actions runs the same on every push and pull request (Python 3.10-3.13 on
 3.12 on macOS).
 Besides the unit tests they include property-based timing tests (hypothesis) and simulated
 failures during a live run (the toggle resets, silent denials, a pulled cable); see
-[docs/timing.md](docs/timing.md#how-it-is-tested).
+[docs/timing.md](docs/timing.md#how-it-is-tested). CI runs the same hypothesis examples
+every time (`HYPOTHESIS_PROFILE=ci`); random ones run nightly (`.github/workflows/nightly.yml`),
+which prints the seed to repeat a failure with `--hypothesis-seed`.
 
 ## Alternative
 This script below sends the request from the computer itself, instead of going through the Mi Community app.

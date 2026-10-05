@@ -35,6 +35,8 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Tests (offline, fake ADB device)
+        env:
+          HYPOTHESIS_PROFILE: ci       # fixed examples; random ones run nightly
         run: python -m pytest -q tests
       - name: Lint
         run: python -m pylint automate.py
