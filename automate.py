@@ -1487,8 +1487,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="latency probes: taps on static text, never the button, between "
                         f"T-120 s and T-60 s (default: {DEFAULT_PROBES})")
     t.add_argument("--api-host", metavar="HOST",
-                   help="also ping HOST from the phone and compensate half of the minimal "
-                        "RTT (default: off, the network delay is not compensated)")
+                   help="EXPERIMENTAL: also ping HOST from the phone and compensate half of "
+                        "the minimal RTT. Half a ping is not a lower bound of the one-way "
+                        "delay on an asymmetric link, so this may send too early "
+                        "(default: off, the network delay is not compensated)")
 
     t.add_argument("--cache-file", metavar="FILE", default=DEFAULT_CACHE_FILE,
                    help="where the last latency measurement is saved; used when no fresh "
@@ -1582,6 +1584,9 @@ def run(args) -> int:
     if args.test:
         mode += " + TEST TIME"
     log.info("Mode: %s", mode)
+    if args.api_host:
+        log.warning("--api-host is experimental: half the ping RTT is not a lower bound of "
+                    "the delay on an asymmetric link - the request may arrive early.")
     if args.lead_ms is not None:
         log.warning("--lead-ms is deprecated and ignored: sending before 00:00 makes the "
                     "request count for the previous day; use --timing / --margin-ms.")

@@ -703,6 +703,8 @@ def test_adaptive_run_pings_api_host(monkeypatch, caplog):
     argv = ["--dry-run", "--test-in", "150", "--api-host", "example.org"]
     assert run_with(monkeypatch, dev, argv) == a.EXIT_OK
     assert "Network RTT to example.org measured: min 40" in caplog.text
+    assert any(r.levelname == "WARNING" and "--api-host is experimental" in r.getMessage()
+               for r in caplog.records)
     assert "compensation 89 ms" in caplog.text   # 69 ms injection + 40 / 2
 
 
