@@ -39,6 +39,7 @@ import re
 import statistics
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -94,6 +95,9 @@ PROBE_START_SEC = 120.0          # in-app probes / latency measurement start at 
 PROBE_END_SEC = 60.0             # ... and must be done by T-60 s
 PROBE_MIN_SEC = 5.0              # no probes if less than this is left before T-60 s
 FINAL_CHECK_SEC = 20.0           # last check (state + UI dump, no input) at T-20 s
+FINAL_CHECK_BUDGET_SEC = 8.0     # ... takes at most this long in total
+FINAL_DUMP_TIMEOUT_SEC = 6.0     # ... with a single uiautomator dump attempt
+LATE_SEND_WARN_MS = 50           # a tap sent later than planned by more than this warns
 PROBE_SAFETY_SEC = 2.0           # the last probe must start this long before T-60 s
 
 MIN_CLICK_DELAY_SEC = 60.0       # the server accepts one unlock request per minute
@@ -189,12 +193,31 @@ class ShellResult:
 class Device:
     """Thin wrapper over adbutils that never lets raw adbutils/socket errors escape."""
 
+    deadline: float | None = None    # time.monotonic() limit for commands, see time_budget
+
     def __init__(self, adb_device: adbutils.AdbDevice) -> None:
         self._dev = adb_device
         self.serial = adb_device.serial
 
+    @contextmanager
+    def time_budget(self, seconds: float):
+        """Commands inside the block share `seconds`; then they raise DeviceError."""
+        self.deadline = time.monotonic() + seconds
+        try:
+            yield
+        finally:
+            self.deadline = None
+
     def run(self, cmd: str, timeout: float = 30.0) -> ShellResult:
-        """Runs a shell command; raises DeviceError only on transport failures."""
+        """Runs a shell command; raises DeviceError only on transport failures/timeouts."""
+        if self.deadline is not None:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise DeviceError(f"adb shell '{cmd}': time budget used up")
+            timeout = min(timeout, left)
+        return self._shell(cmd, timeout)
+
+    def _shell(self, cmd: str, timeout: float) -> ShellResult:
         try:
             ret = self._dev.shell2(cmd, timeout=timeout, rstrip=True)
         except (AdbError, OSError) as exc:
@@ -437,11 +460,11 @@ def find_probe_target(xml_text: str, avoid: Button | None) -> Button | None:
     return walk(ET.fromstring(xml_text), False)
 
 
-def dump_ui(dev: Device, attempts: int = 3) -> str:
+def dump_ui(dev: Device, attempts: int = 3, timeout: float = 40.0) -> str:
     """uiautomator dump with retries (it fails while animations are running)."""
     last_err = ""
     for attempt in range(1, attempts + 1):
-        res = dev.run(f"uiautomator dump {DEVICE_XML_PATH}", timeout=40)
+        res = dev.run(f"uiautomator dump {DEVICE_XML_PATH}", timeout=timeout)
         if res.ok and "dumped to" in res.output.lower():
             xml = dev.run(f"cat {DEVICE_XML_PATH}", timeout=20).output
             dev.run(f"rm -f {DEVICE_XML_PATH}", timeout=10)
@@ -451,7 +474,8 @@ def dump_ui(dev: Device, attempts: int = 3) -> str:
         else:
             last_err = res.first_line_of_error()
         log.debug("uiautomator dump attempt %d failed: %s", attempt, last_err)
-        time.sleep(1.5)
+        if attempt < attempts:
+            time.sleep(1.5)
     raise DeviceError(f"uiautomator dump failed: {last_err}")
 
 
@@ -561,7 +585,11 @@ class InjectProbe:
 
 def device_time(dev: Device) -> str:
     """Device clock in logcat -T format ('' if unknown)."""
-    out = dev.run("date '+%m-%d %H:%M:%S.000'", timeout=10).output.strip()
+    try:
+        out = dev.run("date '+%m-%d %H:%M:%S.000'", timeout=10).output.strip()
+    except DeviceError as exc:
+        log.debug("Device time unknown: %s", exc)
+        return ""
     return out if _DEVICE_TIME_RE.fullmatch(out) else ""
 
 
@@ -1228,21 +1256,28 @@ def final_check(dev: Device, button_text: str, button: Button,
     """
     Last check before firing: device state and a fresh UI dump (the app may have
     restarted or scrolled since the audit). Injects no input - it runs in the last
-    minute before the target. Returns the button to tap and the UI dump ('' if it failed).
-    Raises DeviceError if tapping is certain to fail.
+    minute before the target - and takes at most FINAL_CHECK_BUDGET_SEC, so a hanging
+    uiautomator cannot eat the send moment. Returns the button to tap and the UI dump
+    ('' if it failed). Raises DeviceError if tapping is certain to fail.
     """
-    problems = health_check(dev)
-    for p in problems:
-        log.error("Final check: %s", p)
-    if NOT_RESPONDING in problems or (need_inject and INJECT_OFF in problems):
-        raise DeviceError("device not ready for clicking: " + "; ".join(problems))
+    with dev.time_budget(FINAL_CHECK_BUDGET_SEC):
+        try:
+            problems = health_check(dev)
+        except DeviceError as exc:
+            log.error("Final check: device state check failed (%s).", exc)
+            problems = []
+        for p in problems:
+            log.error("Final check: %s", p)
+        if NOT_RESPONDING in problems or (need_inject and INJECT_OFF in problems):
+            raise DeviceError("device not ready for clicking: " + "; ".join(problems))
 
-    try:
-        xml = dump_ui(dev, attempts=2)
-        fresh = find_button(xml, button_text, BUTTON_RESOURCE_ID)
-    except (DeviceError, ET.ParseError) as exc:
-        log.error("Final check: UI dump failed (%s) - tapping the audited coordinates.", exc)
-        return button, ""
+        try:
+            xml = dump_ui(dev, attempts=1, timeout=FINAL_DUMP_TIMEOUT_SEC)
+            fresh = find_button(xml, button_text, BUTTON_RESOURCE_ID)
+        except (DeviceError, ET.ParseError) as exc:
+            log.error("Final check: UI dump failed (%s) - tapping the audited coordinates.",
+                      exc)
+            return button, ""
     if fresh is None:
         log.error("Final check: '%s' is not on screen - tapping the audited coordinates.",
                   button_text)
@@ -1416,13 +1451,28 @@ def verify_after_tap(dev: Device, button: Button, button_text: str,
     return True
 
 
-def click(dev: Device, button: Button, clock: Clock, args) -> int:
-    """Taps args.clicks times. Returns the number of taps injected successfully."""
+def warn_if_late(i: int, count: int, due: datetime, now: datetime) -> None:
+    """WARN if tap i is sent more than LATE_SEND_WARN_MS after its planned moment."""
+    late_ms = (now - due).total_seconds() * 1000
+    if late_ms > LATE_SEND_WARN_MS:
+        log.warning("Tap %d/%d is %.0f ms late: planned at %s CST, sending at %s CST.",
+                    i, count, late_ms, fmt_time(due, BEIJING_OFFSET), fmt_time(now, BEIJING_OFFSET))
+
+
+def click(dev: Device, button: Button, clock: Clock, args,
+          planned: datetime | None = None) -> int:
+    """
+    Taps args.clicks times (the first one planned at `planned`). Returns the number of
+    taps injected successfully.
+    """
     cmd = tap_command(button.x, button.y)
     count = args.clicks
     done = 0
     for i in range(1, count + 1):
-        stamp = clock.now().astimezone(timezone(BEIJING_OFFSET)).strftime("%H:%M:%S.%f")[:-3]
+        now = clock.now()
+        stamp = fmt_time(now, BEIJING_OFFSET)
+        if planned is not None:
+            warn_if_late(i, count, planned + timedelta(seconds=args.delay * (i - 1)), now)
         if args.dry_run:
             log.info("[DRY-RUN] tap %d/%d at %s CST: would run '%s'", i, count, stamp, cmd)
             done += 1
@@ -1673,9 +1723,10 @@ def fire(ses: Session, button: Button) -> int:
         wait_until(check_at, clock, dev, quiet=True)
     button, xml_before = final_check(dev, args.button_text, button,
                                      need_inject=not args.dry_run)
-    since = device_time(dev)    # logcat window for the post-tap denial check
+    with dev.time_budget(2.0):
+        since = device_time(dev)    # logcat window for the post-tap denial check
     wait_until(send_utc, clock, dev, quiet=True)
-    done = click(dev, button, clock, args)
+    done = click(dev, button, clock, args, planned=send_utc)
     if not args.dry_run and done:
         log.info("Keeping the screen on for 5 s while the request loads...")
         time.sleep(5)

@@ -77,8 +77,13 @@ class FakeDevice(a.Device):
         self.tap_rt_ms = tap_rt_ms           # round-trip of a tap command
         self.inject_log = inject_log         # HyperOS logs every injection (MIUIInput)
 
-    def run(self, cmd, timeout=30.0):
+    hang = ()                                # command prefixes that never answer
+
+    def _shell(self, cmd, timeout):
         self.commands.append(cmd)
+        if cmd.startswith(self.hang):
+            a.time.sleep(timeout)
+            raise a.DeviceError(f"adb shell '{cmd}' failed: timeout")
         tap = re.fullmatch(r'echo "miunlock_start=\$\{EPOCHREALTIME:-\$\(date \+%s\.%N\)\}"; '
                            r'(input tap .*)', cmd)
         if tap:
@@ -439,6 +444,31 @@ def test_probe_phase_stops_on_silent_denial(monkeypatch, measure):
                     clock.t + timedelta(seconds=120), measure)
     with pytest.raises(a.DeviceError, match="Permission denied: injecting"):
         a.probe_phase(ses, a.find_button(UI_XML, "Apply for unlocking", "x"))
+
+
+@pytest.mark.parametrize("hang", [("uiautomator dump",), ("uiautomator dump", "dumpsys")])
+def test_final_check_stays_within_budget(monkeypatch, caplog, hang):
+    use_virtual_time(monkeypatch)
+    dev = FakeDevice()
+    dev.hang = hang
+    button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+    start = a.time.monotonic()
+    fresh, xml = a.final_check(dev, "Apply for unlocking", button, need_inject=True)
+    assert a.time.monotonic() - start <= a.FINAL_CHECK_BUDGET_SEC + 0.05   # 1 ms per call
+    assert (fresh, xml) == (button, "")
+    assert sum(c.startswith("uiautomator dump") for c in dev.commands) <= 1
+    assert any(r.levelname == "ERROR" and "tapping the audited coordinates" in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize("late_ms, warns", [(100, True), (30, False)])
+def test_late_send_warns(monkeypatch, caplog, late_ms, warns):
+    monkeypatch.setattr(a.time, "sleep", lambda s: None)
+    clock = FakeClock()
+    button = a.find_button(UI_XML, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+    args = a.build_parser().parse_args(["--dry-run"])
+    a.click(FakeDevice(), button, clock, args, planned=clock.t - timedelta(milliseconds=late_ms))
+    assert ("ms late: planned at" in caplog.text) == warns
 
 
 def test_final_check_injects_nothing(monkeypatch):
