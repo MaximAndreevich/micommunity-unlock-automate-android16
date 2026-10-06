@@ -1,11 +1,15 @@
 """Fixtures shared by all offline tests, and the hypothesis profiles."""
 
 import os
+import sys
+from pathlib import Path
 
 import pytest
 from hypothesis import settings
 
-from fakes import a
+# the miunlock package lives in the repository root, next to automate.py
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from miunlock import cli  # noqa: E402  pylint: disable=wrong-import-position
 
 # HYPOTHESIS_PROFILE picks one. No deadline anywhere: a slow (macOS) runner is no bug.
 # ci: the same examples on every run - a pull request cannot fail on a random
@@ -22,5 +26,5 @@ def cache_file(tmp_path, monkeypatch):
     """Keeps tests away from the real latency cache next to the script."""
     monkeypatch.chdir(tmp_path)          # screenshots / logcat after a tap land here
     path = tmp_path / "latency.json"
-    monkeypatch.setattr(a, "DEFAULT_CACHE_FILE", str(path))
+    monkeypatch.setattr(cli, "DEFAULT_CACHE_FILE", str(path))
     return path

@@ -226,7 +226,7 @@ Offline tests with a simulated device (no phone needed):
 ```shell
 pip install -r requirements-dev.txt
 python -m pytest -q tests
-pylint automate.py
+pylint automate.py miunlock
 ```
 GitHub Actions runs the same on every push and pull request (Python 3.10-3.13 on Linux,
 3.12 on macOS).

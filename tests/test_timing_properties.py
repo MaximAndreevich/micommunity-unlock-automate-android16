@@ -7,8 +7,9 @@ import pytest
 from hypothesis import HealthCheck, assume, example, given, settings
 from hypothesis import strategies as st
 
-from fakes import (FakeDevice, a, assert_timing_invariants, measurement, ms,
+from fakes import (FakeDevice, assert_timing_invariants, measurement, ms,
                    planned, run_with)
+from miunlock import adb, cli, timing
 
 delays = st.floats(min_value=0, max_value=5000, allow_nan=False, allow_infinity=False)
 samples = st.lists(delays, min_size=1, max_size=30)
@@ -24,7 +25,8 @@ def option_lists(margins):
 
 options = option_lists(st.integers(min_value=0, max_value=2000).map(str))
 # margins the guard accepts: below MIN_ARRIVAL_MS it replaces the plan with the fixed one
-guarded_options = option_lists(st.integers(min_value=a.MIN_ARRIVAL_MS, max_value=2000).map(str))
+guarded_options = option_lists(
+    st.integers(min_value=timing.MIN_ARRIVAL_MS, max_value=2000).map(str))
 targets = st.builds(
     lambda moment, offset_min: moment.replace(tzinfo=timezone.utc).astimezone(
         timezone(timedelta(minutes=offset_min))),
@@ -39,11 +41,11 @@ def measurements(draw):
     round_trip = draw(st.one_of(
         st.none(),                                               # inject + 50 ms
         st.lists(st.floats(min_value=0.1, max_value=6000), min_size=1, max_size=30)))
-    adb = draw(st.one_of(st.none(), st.lists(st.floats(min_value=0.1, max_value=500),
-                                             min_size=1, max_size=5)))
+    adb_rtt = draw(st.one_of(st.none(), st.lists(st.floats(min_value=0.1, max_value=500),
+                                                 min_size=1, max_size=5)))
     net = draw(st.one_of(st.none(), st.lists(st.floats(min_value=0.1, max_value=1000),
                                              min_size=1, max_size=10)))
-    return measurement(inject, round_trip, adb, net)
+    return measurement(inject, round_trip, adb_rtt, net)
 
 
 # ------------------------------------------------------------------- the plan
@@ -123,7 +125,7 @@ def probe_runs(draw):
                      "printed": draw(st.booleans()) or not taps,    # lost start line
                      "logged": draw(st.booleans())})                # lost logcat line
         # the next command starts after this one returned and the PROBE_GAP_SEC sleep
-        start += duration + int(a.PROBE_GAP_SEC * SEC) + draw(st.integers(0, SEC))
+        start += duration + int(timing.PROBE_GAP_SEC * SEC) + draw(st.integers(0, SEC))
     return resolution_digits, taps
 
 
@@ -149,11 +151,11 @@ ALIGNED = 1_800_000_000 * SEC + 999            # printed as ...000000: 999 ns to
 def test_measured_delay_is_a_lower_bound_of_the_real_one(run):
     digits, taps = run
     printed = [t for t in taps if t["printed"]]
-    starts = [a.tap_start(printed_start(t["start"], digits)) for t in printed]
+    starts = [adb.tap_start(printed_start(t["start"], digits)) for t in printed]
     logcat = "\n".join([logcat_line(taps[0]["start"] - SEC)]      # the audit probe, before
                        + [logcat_line(t["start"] + t["delay"]) for t in taps if t["logged"]])
-    measured = a.injection_delays(starts, a.injection_times(logcat),
-                                  [t["round_trip_ms"] for t in printed])
+    measured = adb.injection_delays(starts, adb.injection_times(logcat),
+                                    [t["round_trip_ms"] for t in printed])
 
     # one sample per tap whose start and injection were both seen, none for the others
     # (a later tap's injection is longer than this tap's round-trip and is dropped)
@@ -178,19 +180,19 @@ def test_real_tap_never_lands_early(cache_file, inject, slack, fixed, offset):
     cache_file.unlink(missing_ok=True)                  # every run measures for itself
     plans = []
     with pytest.MonkeyPatch.context() as mp:
-        real_log_plan = a.log_plan
+        real_log_plan = timing.log_plan
 
         def spy(plan, target_utc, send_utc, *rest):
             plans.append((plan, target_utc))
             return real_log_plan(plan, target_utc, send_utc, *rest)
-        mp.setattr(a, "log_plan", spy)
+        mp.setattr(cli, "log_plan", spy)
         dev = FakeDevice(inject_ms=inject, tap_rt_ms=max(inject) + slack,
                          device_clock_offset=offset)                # phone clock - PC clock
         argv = ["--test-in", "150"] + (["--timing", "fixed"] if fixed else [])
-        assert run_with(mp, dev, argv) == a.EXIT_OK
+        assert run_with(mp, dev, argv) == cli.EXIT_OK
 
     [(plan, target)] = plans
     [injected] = [t for cmd, t in dev.injections if cmd in dev.taps]
     assert plan.compensation_ms <= min(inject)
     assert injected >= (target + ms(plan.margin_ms)).timestamp() >= \
-        (target + ms(a.MIN_ARRIVAL_MS)).timestamp()
+        (target + ms(timing.MIN_ARRIVAL_MS)).timestamp()

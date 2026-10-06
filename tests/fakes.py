@@ -5,12 +5,10 @@ import itertools
 import json
 import math
 import re
-import sys
+import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import automate as a  # noqa: E402  pylint: disable=wrong-import-position
+from miunlock import adb, cli, timing
 
 
 UI_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
@@ -47,7 +45,7 @@ SETTINGS_EXC = ("Exception occurred while executing 'put':\njava.lang.SecurityEx
 
 
 
-class FakeDevice(a.Device):
+class FakeDevice(adb.Device):
     def __init__(self, inject=True, settings=True, focus="com.mi.global.bbs", xml=UI_XML,
                  adbinput=None, brand="Xiaomi", silent_denial=False, inject_ms=70.0,
                  tap_rt_ms=120.0, inject_log=True, real_tap_inject_ms=None,
@@ -90,7 +88,7 @@ class FakeDevice(a.Device):
     def _advance(self):
         if not self.timeline:
             return                           # no extra clock calls in plain tests
-        now = a.time.time()
+        now = time.time()
         while self.timeline and self.timeline[0][0] <= now:
             for name, value in self.timeline.pop(0)[1].items():
                 setattr(self, name, value)
@@ -99,10 +97,10 @@ class FakeDevice(a.Device):
         self._advance()
         self.commands.append(cmd)
         if cmd.startswith(self.broken):
-            raise a.DeviceError(f"adb shell '{cmd}' failed: device offline")
+            raise adb.DeviceError(f"adb shell '{cmd}' failed: device offline")
         if cmd.startswith(self.hang):
-            a.time.sleep(timeout)
-            raise a.DeviceError(f"adb shell '{cmd}' failed: timeout")
+            time.sleep(timeout)
+            raise adb.DeviceError(f"adb shell '{cmd}' failed: timeout")
         tap = re.fullmatch(r'echo "miunlock_start=\$\{EPOCHREALTIME:-\$\(date \+%s\.%N\)\}"; '
                            r'(input tap .*)', cmd)
         if tap:
@@ -121,12 +119,12 @@ class FakeDevice(a.Device):
                 out, rc = SECURITY_EXC.replace("'tap'", f"'{cmd.split()[1]}'"), 255
             elif cmd.startswith("input tap") and "-500" not in cmd:
                 x, y = map(int, cmd.split()[2:4])
-                button = a.find_button(self.xml, "Apply for unlocking", a.BUTTON_RESOURCE_ID)
+                button = adb.find_button(self.xml, "Apply for unlocking", adb.BUTTON_RESOURCE_ID)
                 if self.silent_denial:
                     self.logcat += LOGCAT_DENIAL + "\n"
-                elif self.focus != a.APP_PACKAGE:
+                elif self.focus != adb.APP_PACKAGE:
                     self.other_window_taps.append(cmd)
-                elif button and a._contains(button.bounds, x, y):
+                elif button and adb._contains(button.bounds, x, y):
                     self.taps.append(cmd)
                 else:
                     self.probe_taps.append(cmd)
@@ -158,21 +156,21 @@ class FakeDevice(a.Device):
                    else "  mCurrentFocus=Window{9c u0 NotificationShade}\n"
                         "  mFocusedApp=ActivityRecord{1 u0 com.mi.global.bbs/.Unlock t5}")
         elif cmd.startswith("uiautomator dump"):
-            out = f"UI hierchary dumped to: {a.DEVICE_XML_PATH}"
+            out = f"UI hierchary dumped to: {adb.DEVICE_XML_PATH}"
         elif cmd.startswith("cat"):
             out = self.xml
-        return a.ShellResult(cmd, rc, out)
+        return adb.ShellResult(cmd, rc, out)
 
     def read_bytes(self, cmd, timeout=15.0):
         self._advance()
         self.commands.append(cmd)
         if cmd.startswith(self.broken):
-            raise a.DeviceError(f"adb shell '{cmd}' failed: device offline")
+            raise adb.DeviceError(f"adb shell '{cmd}' failed: device offline")
         return b"\x89PNG\r\n\x1a\nfake"
 
     def _timed_tap(self, cmd, timeout):
         """tap_command(): prints the start time, logs the injection like HyperOS."""
-        start = a.time.time()
+        start = time.time()
         button_taps = len(self.taps)
         res = self.run(cmd, timeout)
         hit_button = len(self.taps) > button_taps
@@ -185,9 +183,9 @@ class FakeDevice(a.Device):
             logged = math.floor((injected + self.clock_offset) * 1000) / 1000   # truncated
             self.logcat += (f"{logged:.3f}  2678 13244 W MIUIInput: Input motion event "
                             "injection from package: null action ACTION_DOWN\n")
-        a.time.sleep(self.tap_rt_ms / 1000)
-        return a.ShellResult(cmd, res.returncode,
-                             f"miunlock_start={start + self.clock_offset:.6f}\n" + res.output)
+        time.sleep(self.tap_rt_ms / 1000)
+        return adb.ShellResult(
+            cmd, res.returncode, f"miunlock_start={start + self.clock_offset:.6f}\n" + res.output)
 
 
 VIRTUAL_START = 1_800_000_000.0
@@ -203,21 +201,21 @@ def use_virtual_time(monkeypatch):
 
     def fake_sleep(sec):
         now[0] += sec
-    monkeypatch.setattr(a.time, "time", fake_time)
-    monkeypatch.setattr(a.time, "monotonic", fake_time)
-    monkeypatch.setattr(a.time, "perf_counter", fake_time)
-    monkeypatch.setattr(a.time, "sleep", fake_sleep)
+    monkeypatch.setattr(time, "time", fake_time)
+    monkeypatch.setattr(time, "monotonic", fake_time)
+    monkeypatch.setattr(time, "perf_counter", fake_time)
+    monkeypatch.setattr(time, "sleep", fake_sleep)
 
 
 DRY = ["--dry-run", "--test-in", "5"]
 
 
 def run_with(monkeypatch, dev, argv):
-    monkeypatch.setattr(a, "connect_device", lambda serial: dev)
+    monkeypatch.setattr(cli, "connect_device", lambda serial: dev)
     use_virtual_time(monkeypatch)
-    args = a.build_parser().parse_args(argv + ["--no-ntp"])
-    a.validate_args(a.build_parser(), args)
-    return a.run(args)
+    args = cli.build_parser().parse_args(argv + ["--no-ntp"])
+    cli.validate_args(cli.build_parser(), args)
+    return cli.run(args)
 
 
 # --------------------------------------------------------------------------- timing
@@ -225,17 +223,17 @@ def run_with(monkeypatch, dev, argv):
 T0 = datetime(2026, 10, 6, 16, 0, tzinfo=timezone.utc)      # 00:00:00 CST
 
 
-def measurement(inject, round_trip=None, adb=None, net=None):
-    stats = a.LatencyStats
-    return a.Measurement(stats(inject), stats(round_trip or [x + 50 for x in inject]),
-                         stats(adb) if adb else None, stats(net) if net else None)
+def measurement(inject, round_trip=None, adb_rtt=None, net=None):
+    stats = timing.LatencyStats
+    return timing.Measurement(stats(inject), stats(round_trip or [x + 50 for x in inject]),
+                              stats(adb_rtt) if adb_rtt else None, stats(net) if net else None)
 
 
-def plan_for(argv, samples=None, net=None, round_trip=None, adb=None):
-    args = a.build_parser().parse_args(argv)
-    measured = measurement(samples, round_trip, adb, net) if samples else None
-    plan = a.plan_timing(args, measured, "test")
-    return a.checked_send_time(plan, T0)
+def plan_for(argv, samples=None, net=None, round_trip=None, adb_rtt=None):
+    args = cli.build_parser().parse_args(argv)
+    measured = measurement(samples, round_trip, adb_rtt, net) if samples else None
+    plan = timing.plan_timing(args, measured, "test")
+    return timing.checked_send_time(plan, T0)
 
 
 def ms(n):
@@ -250,50 +248,50 @@ def proven_delay_ms(plan, measured):
 
 
 def assert_timing_invariants(plan, send, target, measured, args):
-    """The first group is computed from the samples, independently of automate.py; the
+    """The first group is computed from the samples, independently of miunlock; the
     rest restates its formulas (consistency, not safety - see test_timing_invariants)."""
     proven = proven_delay_ms(plan, measured)
     # independent: even the fastest measured delivery arrives after target + 50 ms
-    assert send + timedelta(milliseconds=proven) >= target + ms(a.MIN_ARRIVAL_MS)
+    assert send + timedelta(milliseconds=proven) >= target + ms(timing.MIN_ARRIVAL_MS)
     # the compensation is whole ms, never more than proven, wasting less than 1 ms
     assert isinstance(plan.compensation_ms, int)
     assert 0 <= plan.compensation_ms <= proven
     if plan.mode == "adaptive":
         assert proven - plan.compensation_ms < 1
         # the device part of a tap fits into its round-trip minus the way there and back
-        adb = measured.adb_rtt.min / 2 if measured.adb_rtt else 0.0
-        assert measured.inject.min <= measured.round_trip.min - adb
+        half_adb = measured.adb_rtt.min / 2 if measured.adb_rtt else 0.0
+        assert measured.inject.min <= measured.round_trip.min - half_adb
     else:
         assert plan.compensation_ms == 0
     # consistency: the send time and the bound it promises agree with the plan
     assert send == plan.send_time(target) == target + ms(plan.margin_ms - plan.compensation_ms)
     assert plan.earliest_arrival(target) == target + ms(plan.margin_ms)
     assert send >= target - ms(plan.compensation_ms)
-    assert plan.margin_ms >= a.MIN_ARRIVAL_MS
+    assert plan.margin_ms >= timing.MIN_ARRIVAL_MS
     assert_margin_rule(plan, measured, args)
 
 
 def assert_margin_rule(plan, measured, args):
     if plan.source == "guard fallback":
-        assert (plan.mode, plan.margin_ms) == ("fixed", a.DEFAULT_MARGIN_MS)
+        assert (plan.mode, plan.margin_ms) == ("fixed", timing.DEFAULT_MARGIN_MS)
     elif plan.mode == "fixed":
         assert plan.margin_ms == args.margin_ms
     else:
-        wide = measured.inject.p95 - measured.inject.min > a.WIDE_SPREAD_MS
-        expected = max(args.adaptive_margin_ms, a.WIDE_SPREAD_MARGIN_MS if wide else 0)
+        wide = measured.inject.p95 - measured.inject.min > timing.WIDE_SPREAD_MS
+        expected = max(args.adaptive_margin_ms, timing.WIDE_SPREAD_MARGIN_MS if wide else 0)
         assert plan.margin_ms == expected
 
 
 def planned(argv, measured, target=T0):
-    args = a.build_parser().parse_args(argv)
-    plan, send = a.checked_send_time(a.plan_timing(args, measured, "test"), target)
+    args = cli.build_parser().parse_args(argv)
+    plan, send = timing.checked_send_time(timing.plan_timing(args, measured, "test"), target)
     return args, plan, send
 
 
 # --------------------------------------------------------------------------- cache
 
 def write_cache(path, serial="fake123", connection="usb", age=timedelta(hours=1),
-                samples=(70, 75, 90), now=None, method=a.CACHE_METHOD):
+                samples=(70, 75, 90), now=None, method=timing.CACHE_METHOD):
     now = now or datetime.fromtimestamp(VIRTUAL_START, timezone.utc)
     data = {"serial": serial, "connection": connection,
             "measured_at": (now - age).isoformat(),
