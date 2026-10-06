@@ -2,7 +2,7 @@
 [![CI](https://github.com/MaximAndreevich/micommunity-unlock-automate-android16/actions/workflows/ci.yml/badge.svg)](https://github.com/MaximAndreevich/micommunity-unlock-automate-android16/actions/workflows/ci.yml)
 
 **WARNING:** This approach is slower than the direct API request by design. ADB adds latency and the app limits your requests to "one per minute"
-check out actual unlocking techniques on XDA forum: https://xdaforums.com/t/how-to-unlock-bootloader-on-xiaomi-hyperos-all-devices-except-cn.4654009/
+[check out actual unlocking techniques on XDA forum](https://xdaforums.com/t/how-to-unlock-bootloader-on-xiaomi-hyperos-all-devices-except-cn.4654009/)
 
 **Description:** Python script to automate Mi Community unlock request at 00:00 beijing time via `ADB`
 
@@ -235,10 +235,3 @@ failures during a live run (the toggle resets, silent denials, a pulled cable); 
 [docs/timing.md](docs/timing.md#how-it-is-tested). CI runs the same hypothesis examples
 every time (`HYPOTHESIS_PROFILE=ci`); random ones run nightly (`.github/workflows/nightly.yml`),
 which prints the seed to repeat a failure with `--hypothesis-seed`.
-
-## Alternative
-This script below sends the request from the computer itself, instead of going through the Mi Community app.
-
-However it is not cross-compatible with all OSes and environments (e.g. `Fedora`).
-
-[GetToken / AQLR script from XDA developers](https://xdaforums.com/t/how-to-unlock-bootloader-on-xiaomi-hyperos-all-devices-except-cn.4654009)
