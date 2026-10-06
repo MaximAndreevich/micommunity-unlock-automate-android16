@@ -1,6 +1,6 @@
 # Send timing
-How `automate.py` picks the moment to send the tap, and why. The short version is in
-the [README](../README.md#timing).
+How `automate.py` picks the moment to send the tap, and why (the code is in
+`miunlock/timing.py`). The short version is in the [README](../README.md#timing).
 
 A request that reaches the server **before** 00:00:00 CST counts for the previous day
 (the quota is used up) and blocks the next request for a minute — the attempt is lost.

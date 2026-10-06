@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from fakes import VIRTUAL_START, FakeDevice, a, ms, run_with
+from fakes import VIRTUAL_START, FakeDevice, ms, run_with
+from miunlock import adb, cli, timing
 
 TEST_IN = 150
 T = VIRTUAL_START + TEST_IN          # the target in virtual time.time(), give or take a few ms
@@ -45,17 +46,17 @@ class Outcome:
 def simulate(monkeypatch, dev, *argv):
     """Runs like main() does: a DeviceError is logged and becomes EXIT_ERROR."""
     targets = []
-    real_log_plan = a.log_plan
+    real_log_plan = timing.log_plan
 
     def spy(plan, target_utc, *rest):
         targets.append(target_utc)
         return real_log_plan(plan, target_utc, *rest)
-    monkeypatch.setattr(a, "log_plan", spy)
+    monkeypatch.setattr(cli, "log_plan", spy)
     try:
         code = run_with(monkeypatch, dev, ["--test-in", str(TEST_IN), *argv])
-    except a.DeviceError as exc:
-        a.log.error("%s", exc)
-        code = a.EXIT_ERROR
+    except adb.DeviceError as exc:
+        cli.log.error("%s", exc)
+        code = cli.EXIT_ERROR
     injected = [datetime.fromtimestamp(t, timezone.utc)
                 for cmd, t in dev.injections if cmd == BUTTON_TAP]
     attempts = sum(cmd.startswith("echo") and cmd.endswith(BUTTON_TAP) for cmd in dev.commands)
@@ -64,12 +65,12 @@ def simulate(monkeypatch, dev, *argv):
 
 def assert_safe(out, clicks=1):
     """No early tap, no extra tap, no false success."""
-    assert out.code in (a.EXIT_OK, a.EXIT_ERROR, a.EXIT_AUDIT)
+    assert out.code in (cli.EXIT_OK, cli.EXIT_ERROR, cli.EXIT_AUDIT)
     assert out.attempts <= clicks
     if out.injected:
         assert out.target is not None
-        assert min(out.injected) >= out.target + ms(a.MIN_ARRIVAL_MS)
-    if out.code == a.EXIT_OK:
+        assert min(out.injected) >= out.target + ms(timing.MIN_ARRIVAL_MS)
+    if out.code == cli.EXIT_OK:
         assert len(out.injected) == clicks
 
 
@@ -82,10 +83,10 @@ def at_target(sec):
 STOPS = {   # (fault, moment): what the log says, button tap commands sent
     ("toggle reset", PROBES): ("input injection is denied", 0),
     ("silent denial", PROBES): ("input injection is denied", 0),
-    ("cable out", PROBES): (a.NOT_RESPONDING, 0),
+    ("cable out", PROBES): (adb.NOT_RESPONDING, 0),
     ("toggle reset", BEFORE_FINAL_CHECK): ("'USB debugging (Security settings)' is OFF", 0),
     ("silent denial", BEFORE_FINAL_CHECK): ("The device rejected the taps", 1),  # undetectable
-    ("cable out", BEFORE_FINAL_CHECK): (a.NOT_RESPONDING, 0),
+    ("cable out", BEFORE_FINAL_CHECK): (adb.NOT_RESPONDING, 0),
     ("toggle reset", BEFORE_TAP): ("Tap 1/1 rejected", 1),
     ("silent denial", BEFORE_TAP): ("The device rejected the taps", 1),
     ("cable out", BEFORE_TAP): ("Tap 1/1 failed", 1),
@@ -99,7 +100,7 @@ def test_fault_stops_the_run_without_a_tap(monkeypatch, caplog, fault, moment):
     out = simulate(monkeypatch, dev)
     message, attempts = STOPS[fault, moment]
     assert_safe(out)
-    assert (out.code, out.injected, out.attempts) == (a.EXIT_ERROR, [], attempts)
+    assert (out.code, out.injected, out.attempts) == (cli.EXIT_ERROR, [], attempts)
     assert message in caplog.text
     if fault == "cable out":
         assert "Restore it manually" in caplog.text
@@ -121,7 +122,7 @@ def test_hanging_tap_is_not_repeated(monkeypatch, caplog):
     dev = FakeDevice()
     dev.at(at_target(BEFORE_TAP), hang=("echo",))
     out = simulate(monkeypatch, dev)
-    assert (out.code, out.attempts) == (a.EXIT_ERROR, 1)
+    assert (out.code, out.attempts) == (cli.EXIT_ERROR, 1)
     assert "Tap 1/1 failed" in caplog.text and "timeout" in caplog.text
     assert dev.store == ORIGINAL_SETTINGS
 
@@ -131,7 +132,7 @@ def test_toggle_reset_between_two_taps_stops_the_second(monkeypatch, caplog):
     dev.at(at_target(30), **TOGGLE_RESET)
     out = simulate(monkeypatch, dev, "--clicks", "2")
     assert_safe(out, clicks=2)
-    assert (out.code, len(out.injected), out.attempts) == (a.EXIT_ERROR, 1, 2)
+    assert (out.code, len(out.injected), out.attempts) == (cli.EXIT_ERROR, 1, 2)
     assert "Tap 2/2 rejected" in caplog.text
     assert "[FAILED] only 1/2 taps" in caplog.text
     assert dev.store == ORIGINAL_SETTINGS
@@ -146,10 +147,10 @@ def test_short_adb_outage_during_probes_falls_back_to_standard_margin(monkeypatc
     dev.at(at_target(PROBES + 10), broken=())
     out = simulate(monkeypatch, dev)
     assert_safe(out)
-    assert out.code == a.EXIT_OK
+    assert out.code == cli.EXIT_OK
     assert "Probe: adb failed" in caplog.text
     assert "using the standard margin of 150 ms" in caplog.text
-    assert out.injected[0] >= out.target + ms(a.DEFAULT_MARGIN_MS)
+    assert out.injected[0] >= out.target + ms(timing.DEFAULT_MARGIN_MS)
     assert not cache_file.exists()
 
 
@@ -159,7 +160,7 @@ def test_toggle_reset_while_waiting_is_reported_and_can_be_fixed(monkeypatch, ca
     dev.at(VIRTUAL_START + 90, inject=True, adbinput="1")
     out = simulate(monkeypatch, dev, "--test-in", "300")
     assert_safe(out)
-    assert out.code == a.EXIT_OK
+    assert out.code == cli.EXIT_OK
     assert any(r.levelname == "ERROR" and r.getMessage().startswith("Heartbeat:")
                and "Security settings" in r.getMessage() for r in caplog.records)
 
@@ -171,7 +172,7 @@ def test_adb_failure_after_the_tap_keeps_the_result(monkeypatch, caplog, broken)
     dev.at(at_target(1), broken=broken)
     out = simulate(monkeypatch, dev)
     assert_safe(out)
-    assert (out.code, len(out.injected)) == (a.EXIT_OK, 1)
+    assert (out.code, len(out.injected)) == (cli.EXIT_OK, 1)
     assert "Could not check logcat for rejected taps" in caplog.text
     assert "[SUCCESS] 1/1 taps injected" in caplog.text
 
@@ -209,7 +210,7 @@ def test_no_tap_when_the_window_changed_after_the_final_check(monkeypatch, caplo
     dev = FakeDevice()
     dev.at(at_target(BEFORE_TAP), **change)
     out = simulate(monkeypatch, dev)
-    assert (out.code, out.attempts, dev.other_window_taps) == (a.EXIT_ERROR, 0, [])
+    assert (out.code, out.attempts, dev.other_window_taps) == (cli.EXIT_ERROR, 0, [])
     assert f"Focus check: {message}" in caplog.text
     assert "[FAILED] only 0/1 taps" in caplog.text
     assert dev.store == ORIGINAL_SETTINGS
@@ -218,7 +219,7 @@ def test_no_tap_when_the_window_changed_after_the_final_check(monkeypatch, caplo
 def test_focus_check_is_rehearsed_in_a_dry_run(monkeypatch, caplog):
     dev = FakeDevice()
     dev.at(at_target(BEFORE_TAP), focus="com.miui.securitycenter")
-    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == a.EXIT_ERROR
+    assert run_with(monkeypatch, dev, ["--dry-run", "--test-in", "150"]) == cli.EXIT_ERROR
     assert "[DRY-RUN] tap" not in caplog.text
     assert "has the focus, not Mi Community" in caplog.text
 
@@ -229,7 +230,7 @@ def test_hanging_focus_check_does_not_delay_the_tap(monkeypatch, caplog):
     dev.at(at_target(BEFORE_TAP), hang=("dumpsys",))
     out = simulate(monkeypatch, dev)
     assert_safe(out)
-    assert (out.code, len(out.injected)) == (a.EXIT_OK, 1)
+    assert (out.code, len(out.injected)) == (cli.EXIT_OK, 1)
     assert "Focus check failed" in caplog.text
     assert "ms late" not in caplog.text
 
@@ -242,10 +243,10 @@ def test_window_opened_after_the_focus_check_gets_the_tap(monkeypatch, caplog):
     reported as a success; only the screenshots show what happened."""
     caplog.set_level("INFO")
     dev = FakeDevice()
-    dev.at(at_target(-a.FOCUS_CHECK_SEC + 1), focus="com.miui.securitycenter")
+    dev.at(at_target(-cli.FOCUS_CHECK_SEC + 1), focus="com.miui.securitycenter")
     out = simulate(monkeypatch, dev)
     assert "Focus check passed" in caplog.text
-    assert (out.code, len(out.injected)) == (a.EXIT_OK, 1)     # injected - into the dialog
+    assert (out.code, len(out.injected)) == (cli.EXIT_OK, 1)     # injected - into the dialog
     assert dev.taps == []                                         # not on the button
     assert dev.other_window_taps == [BUTTON_TAP]
     assert "[SUCCESS] 1/1 taps injected" in caplog.text

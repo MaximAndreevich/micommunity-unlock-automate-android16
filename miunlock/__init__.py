@@ -17,11 +17,22 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 
-"""Entry point: `python automate.py --help`. The code lives in the miunlock package."""
+"""
+Automates the Mi Community "Apply for unlocking" request at the moment
+the daily quota resets (00:00 Beijing time).
 
-import sys
+Flow:
+  1. Preflight audit: ADB, device state, shell permissions (input injection,
+     settings write), UI dump, Mi Community in foreground, button present, NTP.
+  2. Keep the screen on, wait until the target time (NTP-corrected clock).
+  3. Tap the button N times, verifying every tap actually got injected.
+  4. Restore the original screen settings, even on Ctrl+C or errors.
 
-from miunlock.cli import main
+Exit codes: 0 ok, 1 runtime error, 2 audit failed, 130 interrupted.
 
-if __name__ == "__main__":
-    sys.exit(main())
+Modules:
+  adb     device wrapper, UI dump, tap command and logcat, screen settings
+  timing  NTP clock, latency measurement and cache, send moment, waiting
+  audit   preflight audit, final and focus checks before the tap
+  cli     arguments and the run itself (probes, wait, tap, checks after it)
+"""

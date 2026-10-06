@@ -39,4 +39,4 @@ jobs:
           HYPOTHESIS_PROFILE: ci       # fixed examples; random ones run nightly
         run: python -m pytest -q tests
       - name: Lint
-        run: python -m pylint automate.py
+        run: python -m pylint automate.py miunlock

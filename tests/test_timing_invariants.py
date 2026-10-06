@@ -5,7 +5,7 @@ Of the checks in fakes.assert_timing_invariants, only a few are independent of t
 send + the delay proven by the samples >= target + 50 ms, the compensation <= that delay,
 and the plausibility limit computed from the round-trips. The rest (send == target +
 margin - compensation, earliest_arrival == target + margin, the margin rules) restate the
-formulas of automate.py: consistency checks, no proof of safety. The proof rests on the
+formulas of miunlock.timing: consistency checks, no proof of safety. The proof rests on the
 end-to-end runs below (the moment the fake phone injects the real tap) and on the lower
 bound property of the measurement in test_timing_properties.py.
 """
@@ -16,7 +16,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from fakes import T0, FakeDevice, a, assert_timing_invariants, measurement, ms, planned, run_with
+from fakes import T0, FakeDevice, assert_timing_invariants, measurement, ms, planned, run_with
+from miunlock import cli, timing
 
 INJECT = [[1.0], [53.04, 66.58, 79.56], [69.999, 70.5], [120.9, 125, 140],
           [100, 110, 120, 400], [900.5, 910]]
@@ -34,10 +35,10 @@ ARGS = [[], ["--adaptive-margin-ms", "0"], ["--adaptive-margin-ms", "49"],
 @pytest.mark.parametrize("argv", ARGS, ids=" ".join)
 @pytest.mark.parametrize("inject", INJECT, ids=str)
 def test_no_false_start_for_any_measurement_and_options(argv, inject):
-    for rt, adb, net, target in itertools.product(ROUND_TRIP, ADB, NET, TARGETS):
-        measured = measurement(inject, ROUND_TRIP[rt](inject), adb, net)
+    for rt, adb_rtt, net, target in itertools.product(ROUND_TRIP, ADB, NET, TARGETS):
+        measured = measurement(inject, ROUND_TRIP[rt](inject), adb_rtt, net)
         args, plan, send = planned(argv, measured, target)
-        case = f"round_trip={rt} adb={adb} net={net} target={target} -> {plan}"
+        case = f"round_trip={rt} adb_rtt={adb_rtt} net={net} target={target} -> {plan}"
         try:
             assert_timing_invariants(plan, send, target, measured, args)
         except AssertionError as exc:
@@ -58,20 +59,20 @@ def test_longer_delay_never_sends_later():
 
 @pytest.mark.parametrize("inject", INJECT, ids=str)
 def test_adaptive_never_sends_later_than_fixed(inject):
-    for adb, net in itertools.product(ADB, NET):
-        adaptive = planned([], measurement(inject, None, adb, net))[2]
+    for adb_rtt, net in itertools.product(ADB, NET):
+        adaptive = planned([], measurement(inject, None, adb_rtt, net))[2]
         assert adaptive <= planned(["--timing", "fixed"], None)[2]
 
 
 def test_guard_is_idempotent():
     for argv, inject in itertools.product(ARGS, INJECT):
         _, plan, send = planned(argv, measurement(inject))
-        assert a.checked_send_time(plan, T0) == (plan, send)
+        assert timing.checked_send_time(plan, T0) == (plan, send)
 
 
 def test_send_time_does_not_depend_on_the_target_time_zone():
     measured = measurement([53.04, 66.58])
-    cst = T0.astimezone(timezone(a.BEIJING_OFFSET))
+    cst = T0.astimezone(timezone(timing.BEIJING_OFFSET))
     assert planned([], measured, cst)[2] == planned([], measured, T0)[2]
 
 
@@ -86,13 +87,13 @@ CLOCK_OFFSETS = pytest.mark.parametrize("offset", [0.0, 3.7, -2.5],
 def real_run(monkeypatch, dev, argv):
     """A non-dry run; returns the plan, the target, the send moment and the injection."""
     plans = []
-    real_log_plan = a.log_plan
+    real_log_plan = timing.log_plan
 
     def spy(plan, target_utc, send_utc, *rest):
         plans.append((plan, target_utc, send_utc))
         return real_log_plan(plan, target_utc, send_utc, *rest)
-    monkeypatch.setattr(a, "log_plan", spy)
-    assert run_with(monkeypatch, dev, ["--test-in", "150"] + argv) == a.EXIT_OK
+    monkeypatch.setattr(cli, "log_plan", spy)
+    assert run_with(monkeypatch, dev, ["--test-in", "150"] + argv) == cli.EXIT_OK
     [(plan, target, send)] = plans
     [injected] = [datetime.fromtimestamp(t, timezone.utc)
                   for cmd, t in dev.injections if cmd in dev.taps]
@@ -100,16 +101,16 @@ def real_run(monkeypatch, dev, argv):
 
 
 @CLOCK_OFFSETS
-@pytest.mark.parametrize("timing", [[], ["--timing", "fixed"]], ids=["adaptive", "fixed"])
+@pytest.mark.parametrize("timing_argv", [[], ["--timing", "fixed"]], ids=["adaptive", "fixed"])
 @pytest.mark.parametrize("inject_ms, tap_rt_ms", [(5, 60), (70, 120), (140, 250),
                                                   ([90, 70, 130, 75], 200)],
                          ids=["fast", "typical", "slow", "jitter"])
 def test_real_tap_is_injected_after_target_plus_margin(monkeypatch, inject_ms, tap_rt_ms,
-                                                       timing, offset):
+                                                       timing_argv, offset):
     dev = FakeDevice(inject_ms=inject_ms, tap_rt_ms=tap_rt_ms, device_clock_offset=offset)
-    plan, target, send, injected = real_run(monkeypatch, dev, timing)
-    assert plan.mode == ("fixed" if timing else "adaptive")
-    assert injected >= target + ms(plan.margin_ms) >= target + ms(a.MIN_ARRIVAL_MS)
+    plan, target, send, injected = real_run(monkeypatch, dev, timing_argv)
+    assert plan.mode == ("fixed" if timing_argv else "adaptive")
+    assert injected >= target + ms(plan.margin_ms) >= target + ms(timing.MIN_ARRIVAL_MS)
     slowest = max(inject_ms) if isinstance(inject_ms, list) else inject_ms
     assert injected - send <= ms(slowest + 20)       # + the virtual cost of the clock calls
 
@@ -171,6 +172,6 @@ def test_real_tap_faster_than_the_probes_by_more_than_the_margin_is_early(monkey
 def test_real_tap_delay_unknown_without_the_injection_line(monkeypatch, caplog):
     caplog.set_level("INFO")
     dev = FakeDevice(inject_log=False)
-    assert run_with(monkeypatch, dev, ["--test-in", "150"]) == a.EXIT_OK
+    assert run_with(monkeypatch, dev, ["--test-in", "150"]) == cli.EXIT_OK
     assert "Real tap 1: start -> injection unknown (no injection line in logcat)" \
         in caplog.text

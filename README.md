@@ -221,12 +221,25 @@ python automate.py --log-file unlock.log
 python automate.py --test --test-timezone 2 --test-time 16:20
 ```
 
+## Code layout
+`automate.py` is only the entry point; the code is in the `miunlock` package next to it:
+
+| Module | What is in it |
+| --- | --- |
+| `miunlock/adb.py` | ADB device wrapper, UI dump and button search, tap command, logcat parsing, screen settings |
+| `miunlock/timing.py` | NTP clock, target time, latency measurement and cache, send moment, waiting ([docs/timing.md](docs/timing.md)) |
+| `miunlock/audit.py` | preflight audit, final and focus checks in the last minute (no input) |
+| `miunlock/cli.py` | arguments, the run (probes, wait, tap, checks after it), exit codes |
+
+`adb` depends on nothing else in the package, `timing` on `adb`, `audit` on both, `cli`
+on everything.
+
 ## Tests
 Offline tests with a simulated device (no phone needed):
 ```shell
 pip install -r requirements-dev.txt
 python -m pytest -q tests
-pylint automate.py
+pylint automate.py miunlock
 ```
 GitHub Actions runs the same on every push and pull request (Python 3.10-3.13 on Linux,
 3.12 on macOS).
